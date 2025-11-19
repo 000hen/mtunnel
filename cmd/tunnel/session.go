@@ -38,6 +38,13 @@ func (sm *SessionManager) AddSession(conn *quic.Conn) *Session {
 	}
 	sm.sessions[id] = session
 
+	conn.RemoteAddr()
+
+	sendOutputAction(OutputAction{
+		Action:    CONNECTED,
+		SessionId: session.ID,
+	})
+
 	return session
 }
 
@@ -134,6 +141,11 @@ func (s *Session) HandleSession(sm *SessionManager, network string, port int, ha
 			default:
 				log.Printf("  Stream accept error: %v", err)
 			}
+
+			sendOutputAction(OutputAction{
+				Action:    DISCONNECT,
+				SessionId: s.ID,
+			})
 
 			return
 		}

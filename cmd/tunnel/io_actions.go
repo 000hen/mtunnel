@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"net"
 	"os"
 )
 
@@ -23,8 +22,6 @@ type OutputAction struct {
 	Action    string   `json:"action"`
 	SessionId string   `json:"session_id,omitempty"`
 	Sessions  []string `json:"sessions,omitempty"`
-	IP        net.IP   `json:"ip,omitempty"`
-	Port      int      `json:"port,omitempty"`
 	Token     string   `json:"token,omitempty"`
 }
 
