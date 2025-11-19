@@ -46,7 +46,7 @@ func runClient(token string, localPort int) {
 			fingerprint := getX509Fingerprint(clientCert)
 			if fingerprint != connToken.Fingerprint {
 				return fmt.Errorf(
-					"certificate fingerprint mismatch: expected %x, got %x",
+					"certificate fingerprint mismatch: expected %s, got %s",
 					hex.EncodeToString(connToken.Fingerprint[:]),
 					hex.EncodeToString(fingerprint[:]),
 				)
