@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/gob"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -44,7 +45,11 @@ func runClient(token string, localPort int) {
 
 			fingerprint := getX509Fingerprint(clientCert)
 			if fingerprint != connToken.Fingerprint {
-				return errors.New("client certificate fingerprint does not match")
+				return fmt.Errorf(
+					"certificate fingerprint mismatch: expected %x, got %x",
+					hex.EncodeToString(connToken.Fingerprint[:]),
+					hex.EncodeToString(fingerprint[:]),
+				)
 			}
 
 			return nil
