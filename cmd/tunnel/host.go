@@ -8,6 +8,9 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -63,33 +66,48 @@ func runHost(network string, forwardPort int) {
 		log.Fatalf("Failed to encode token: %v", err)
 	}
 
+	encodedToken := base64.StdEncoding.EncodeToString(buf.Bytes())
+
 	log.Println("Connection Token:")
 	log.Println("-------------")
-	log.Println(base64.StdEncoding.EncodeToString(buf.Bytes()))
+	log.Println(encodedToken)
 	log.Println("-------------")
+
+	sendOutputAction(OutputAction{
+		Action: TOKEN,
+		Token:  encodedToken,
+	})
+
+	sessions := NewSessionManager()
+	go handleIOAction(sessions)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		log.Println("Initiating graceful shutdown...")
+		sessions.CloseAllSessions()
+		listener.Close()
+	}()
 
 	for {
 		ctx := context.Background()
 		sess, err := listener.Accept(ctx)
 		if err != nil {
+			if err == quic.ErrServerClosed {
+				log.Println("QUIC listener closed, exiting...")
+				return
+			}
+
 			log.Fatalf("Failed to accept QUIC session: %v", err)
 			continue
 		}
 
 		log.Println("New QUIC session accepted from", sess.RemoteAddr().String())
+		session := sessions.AddSession(sess)
 
-		// 持續接受該 session 中的多個 streams
-		go func(session *quic.Conn) {
-			for {
-				ctx := context.Background()
-				stream, err := session.AcceptStream(ctx)
-				if err != nil {
-					log.Println("Session closed or failed to accept stream:", err)
-					return
-				}
-
-				go handleStreamToQUIC(stream, network, forwardPort)
-			}
-		}(sess)
+		go session.HandleSession(sessions, network, forwardPort, handleStreamToQUIC)
 	}
 }

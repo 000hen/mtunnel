@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -78,9 +81,33 @@ func runClient(token string, localPort int) {
 	defer listen.Close()
 	log.Printf("Listening for local connections on %s\n", listen.Addr().String())
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-conn.Context().Done()
+		cause := context.Cause(conn.Context())
+		log.Printf("Connection lost: %v", cause)
+		log.Println("Stopping local listener...")
+		listen.Close()
+	}()
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		log.Println("Initiating graceful shutdown...")
+		conn.CloseWithError(0, "client shutdown by user")
+		listen.Close()
+	}()
+
 	for {
 		localConn, err := listen.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				log.Println("Local listener closed, exiting...")
+				return
+			}
+
 			log.Printf("Failed to accept local connection: %v", err)
 			continue
 		}

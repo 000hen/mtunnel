@@ -92,17 +92,5 @@ func openUDPForP2P(server string) (*net.UDPConn, *stun.XORMappedAddress, error) 
 		return nil, nil, err
 	}
 
-	// go keepAlive(conn, stunAddr)
-
 	return conn, &xorAddr, nil
-}
-
-func keepAlive(conn *net.UDPConn, target *net.UDPAddr) {
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		log.Println("Sending keepalive to", target.String())
-		_, _ = conn.WriteToUDP([]byte("keepalive"), target)
-	}
 }
