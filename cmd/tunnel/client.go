@@ -74,6 +74,10 @@ func runClient(token string, localPort int) {
 	defer conn.CloseWithError(0, "client shutdown")
 	log.Println("Connected to host at", conn.RemoteAddr().String())
 
+	sendOutputAction(OutputAction{
+		Action: CONNECTED,
+	})
+
 	listen, err := net.Listen(connToken.Network, fmt.Sprintf("localhost:%d", localPort))
 	if err != nil {
 		log.Fatalf("Failed to listen on local port %d: %v", localPort, err)
