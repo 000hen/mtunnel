@@ -1,71 +1,110 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/gob"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 )
 
-func runHost(host host.Host, networkType string, forwardPort int) {
-	ctx, cancel := context.WithCancel(context.Background())
+func runHost(ctx context.Context, h host.Host, networkType string, forwardPort int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	session := NewSessionManager(host.Network())
-
-	shutdownChan := make(chan string, 1)
 	requestShutdown := func(reason string) {
-		if reason == "" {
-			reason = "stdin shutdown request"
-		}
-		select {
-		case shutdownChan <- reason:
-		default:
-		}
+		log.Printf("Shutdown requested: %s", reason)
+		cancel()
 	}
 
-	idht, err := setupDHT(ctx, host, true)
+	idht, err := setupDHT(ctx, h, true)
 	if err != nil {
-		cancel()
-		_ = host.Close()
-		sendOutputAction(OutputAction{
-			Action: ERROR,
-			Error:  fmt.Sprintf("Failed to create DHT: %v", err),
-		})
-		log.Fatalf("Failed to create DHT: %v", err)
+		_ = h.Close()
+		return fmt.Errorf("create DHT: %w", err)
 	}
 
 	log.Println("Waiting for network stabilization...")
-	time.Sleep(networkStabilizationDelay)
+	select {
+	case <-time.After(networkStabilizationDelay):
+	case <-ctx.Done():
+		closeTransport(idht, h)
+		return nil
+	}
 
+	logHostAddrs(h)
+
+	encodedToken, err := ConnToken{Network: networkType, ID: h.ID()}.Encode()
+	if err != nil {
+		closeTransport(idht, h)
+		return err
+	}
+	announceToken(encodedToken)
+
+	session := NewSessionManager(h.Network())
+	var wg sync.WaitGroup
+
+	// Register the stream handler before announcing readiness so that an eager
+	// client cannot connect during a window where no handler is installed.
+	h.SetStreamHandler(protocolID, func(s network.Stream) {
+		peer := s.Conn().RemotePeer()
+		session.AddSession(peer, s.Conn())
+		defer session.RemoveSession(peer, false)
+
+		handleHostStream(s, networkType, forwardPort)
+	})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleIOAction(ctx, session, requestShutdown)
+	}()
+
+	<-ctx.Done()
+	log.Println("Initiating graceful shutdown...")
+
+	// Stop accepting new streams, tear down active ones, then wait for the IO
+	// handler to return before closing the transport.
+	h.RemoveStreamHandler(protocolID)
+	session.ForceCloseAllSessions()
+	wg.Wait()
+
+	closeTransport(idht, h)
+	log.Println("Shutdown completed.")
+
+	return nil
+}
+
+// handleHostStream forwards a single inbound tunnel stream to the local service.
+func handleHostStream(s network.Stream, networkType string, forwardPort int) {
+	remote := s.Conn().RemotePeer()
+	log.Println("New stream opened from:", remote)
+	defer s.Close()
+
+	addr := fmt.Sprintf("localhost:%d", forwardPort)
+	localConn, err := net.DialTimeout(networkType, addr, defaultLocalDialTimeout)
+	if err != nil {
+		log.Printf("Failed to connect to local service on %s: %v", addr, err)
+		return
+	}
+	defer localConn.Close()
+
+	log.Printf("Connected to local service on %s", addr)
+	pipe(s, localConn)
+	log.Println("Stream closed for peer:", remote)
+}
+
+func logHostAddrs(h host.Host) {
 	log.Println("Listening on addresses:")
-	for _, addr := range host.Addrs() {
+	for _, addr := range h.Addrs() {
 		log.Println(" - ", addr.String())
 	}
+}
 
-	token := ConnToken{
-		Network: networkType,
-		ID:      host.ID(),
-	}
-
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(token); err != nil {
-		log.Fatalf("Failed to encode token: %v", err)
-	}
-
-	encodedToken := base64.StdEncoding.EncodeToString(buf.Bytes())
-
+func announceToken(encodedToken string) {
 	log.Println("Connection Token:")
 	log.Println("-------------")
 	log.Println(encodedToken)
@@ -75,80 +114,4 @@ func runHost(host host.Host, networkType string, forwardPort int) {
 		Action: TOKEN,
 		Token:  encodedToken,
 	})
-
-	var cleanupOnce sync.Once
-	var wg sync.WaitGroup
-
-	cleanup := func() {
-		cleanupOnce.Do(func() {
-			log.Println("Cleaning up...")
-			cancel()
-			session.ForceCloseAllSessions()
-			wg.Wait()
-
-			if err := idht.Close(); err != nil {
-				log.Printf("Error closing DHT: %v", err)
-			}
-			if err := host.Close(); err != nil {
-				log.Printf("Error closing libp2p host: %v", err)
-			}
-		})
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		handleIOAction(ctx, session, requestShutdown)
-	}()
-
-	host.SetStreamHandler(protocolID, func(s network.Stream) {
-		wg.Add(1)
-		defer wg.Done()
-
-		peer := s.Conn().RemotePeer()
-		session.AddSession(peer, s.Conn())
-
-		handleStream(s, networkType, forwardPort)
-
-		session.RemoveSession(s.Conn().RemotePeer(), false)
-	})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	var shutdownReason string
-	select {
-	case sig := <-sigChan:
-		shutdownReason = fmt.Sprintf("signal: %v", sig)
-	case reason := <-shutdownChan:
-		shutdownReason = reason
-	}
-
-	if shutdownReason == "" {
-		shutdownReason = "shutdown requested"
-	}
-	log.Printf("Received shutdown trigger (%s)", shutdownReason)
-	log.Println("Initiating graceful shutdown...")
-
-	cleanup()
-
-	log.Println("Shutdown completed.")
-}
-
-func handleStream(s network.Stream, network string, forwardPort int) {
-	log.Println("New stream opened from:", s.Conn().RemotePeer())
-	defer s.Close()
-
-	addr := fmt.Sprintf("localhost:%d", forwardPort)
-	localConn, err := net.DialTimeout(network, addr, defaultLocalDialTimeout)
-	if err != nil {
-		log.Printf("Failed to connect to local service on %s: %v", addr, err)
-		return
-	}
-	defer localConn.Close()
-
-	log.Printf("Connected to local service on %s", addr)
-
-	pipe(s, localConn)
-	log.Println("Stream closed for peer:", s.Conn().RemotePeer())
 }

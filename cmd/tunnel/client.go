@@ -1,174 +1,127 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
-	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func runClient(host host.Host, token string, localPort int) {
-	var decodedToken ConnToken
+func runClient(ctx context.Context, h host.Host, token string, localPort int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Decode the connection token
-	data, err := base64.StdEncoding.DecodeString(token)
+	decodedToken, err := DecodeToken(token)
 	if err != nil {
-		log.Fatalf("Failed to decode token: %v", err)
+		_ = h.Close()
+		return err
 	}
 
-	if err := gob.NewDecoder(bytes.NewBuffer(data)).Decode(&decodedToken); err != nil {
-		log.Fatalf("Failed to decode token data: %v", err)
-	}
-
-	// Setup DHT for peer discovery
-	dhtCtx, dhtCancel := context.WithCancel(context.Background())
-	clientDHT, err := setupDHT(dhtCtx, host, false)
+	// The DHT shares the client's lifetime: it is created with ctx and closed
+	// during cleanup, so it stays usable for the whole discovery phase.
+	clientDHT, err := setupDHT(ctx, h, false)
 	if err != nil {
-		dhtCancel()
-		_ = host.Close()
-		log.Fatalf("Failed to bootstrap DHT: %v", err)
+		_ = h.Close()
+		return fmt.Errorf("bootstrap DHT: %w", err)
 	}
 
 	log.Println("Routing table size:", clientDHT.RoutingTable().Size())
-	info, err := findPeerInDHT(dhtCtx, clientDHT, decodedToken.ID)
+
+	info, err := findPeerInDHT(ctx, clientDHT, decodedToken.ID)
 	if err != nil {
-		dhtCancel()
-		sendOutputAction(OutputAction{
-			Action: ERROR,
-			Error:  fmt.Sprintf("Failed to discover peer %s: %v", decodedToken.ID, err),
-		})
-		_ = clientDHT.Close()
-		_ = host.Close()
-		log.Fatalf("Failed to discover peer %s: %v", decodedToken.ID, err)
-	}
-	dhtCancel()
-
-	var remoteWatcher network.Notifiee
-
-	// cleanup
-	var cleanupOnce sync.Once
-	cleanupTransport := func() {
-		cleanupOnce.Do(func() {
-			if remoteWatcher != nil {
-				host.Network().StopNotify(remoteWatcher)
-			}
-			if err := clientDHT.Close(); err != nil {
-				log.Printf("Error closing DHT: %v", err)
-			}
-			if err := host.Close(); err != nil {
-				log.Printf("Error closing libp2p host: %v", err)
-			}
-		})
+		closeTransport(clientDHT, h)
+		return fmt.Errorf("discover peer %s: %w", decodedToken.ID, err)
 	}
 
-	shutdownChan := make(chan string, 1)
 	requestShutdown := func(reason string) {
-		if reason == "" {
-			reason = "stdin shutdown request"
-		}
-		select {
-		case shutdownChan <- reason:
-		default:
-		}
+		log.Printf("Shutdown requested: %s", reason)
+		cancel()
 	}
-
-	// Connect to the discovered peer
-	ctx, cancel := context.WithCancel(context.Background())
 	go handleIOAction(ctx, nil, requestShutdown)
-	if err := connectToPeer(ctx, host, info); err != nil {
-		sendOutputAction(OutputAction{
-			Action: ERROR,
-			Error:  fmt.Sprintf("Failed to connect to peer %s: %v", decodedToken.ID, err),
-		})
-		cleanupTransport()
-		log.Fatalf("Failed to connect to peer %s: %v", decodedToken.ID, err)
+
+	if err := connectToPeer(ctx, h, info); err != nil {
+		closeTransport(clientDHT, h)
+		return fmt.Errorf("connect to peer %s: %w", decodedToken.ID, err)
 	}
 
-	remoteWatcher = newRemoteDisconnectWatcher(decodedToken.ID, requestShutdown)
-	host.Network().Notify(remoteWatcher)
+	// Shut the client down if the host goes away entirely.
+	watcher := newRemoteDisconnectWatcher(decodedToken.ID, requestShutdown)
+	h.Network().Notify(watcher)
 
-	// Start listening on the local port
 	listen, err := net.Listen(decodedToken.Network, fmt.Sprintf("localhost:%d", localPort))
 	if err != nil {
-		cleanupTransport()
-		log.Fatalf("Failed to listen on local port %d: %v", localPort, err)
+		h.Network().StopNotify(watcher)
+		closeTransport(clientDHT, h)
+		return fmt.Errorf("listen on local port %d: %w", localPort, err)
 	}
 
 	log.Printf("Listening for local connections on %s", listen.Addr().String())
-
-	port := listen.Addr().(*net.TCPAddr).Port
 	sendOutputAction(OutputAction{
 		Action:    CONNECTED,
-		SessionId: host.ID(),
-		Port:      port,
+		SessionId: h.ID(),
+		Port:      listen.Addr().(*net.TCPAddr).Port,
 	})
 
 	var wg sync.WaitGroup
-	go func(listen net.Listener) {
-		for {
-			localConn, err := listen.Accept()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					log.Println("Local listener closed, exiting...")
-					return
-				}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		acceptLocalConns(ctx, h, decodedToken.ID, listen)
+	}()
 
-				log.Printf("Failed to accept local connection: %v", err)
-				continue
-			}
-
-			wg.Add(1)
-			go func(conn net.Conn) {
-				defer wg.Done()
-				handleClientStream(ctx, host, decodedToken.ID, conn)
-			}(localConn)
-		}
-	}(listen)
-
-	// Handle graceful shutdown on interrupt signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	var shutdownReason string
-	select {
-	case sig := <-sigChan:
-		shutdownReason = fmt.Sprintf("signal: %v", sig)
-	case reason := <-shutdownChan:
-		shutdownReason = reason
-	}
-
-	if shutdownReason == "" {
-		shutdownReason = "shutdown requested"
-	}
-	log.Printf("Received shutdown trigger (%s)", shutdownReason)
+	<-ctx.Done()
 	log.Println("Initiating graceful shutdown...")
 
-	cancel()
+	// Stop watching, stop accepting, then close the transport (which unblocks
+	// any in-flight pipes) before waiting for the accept loop to drain.
+	h.Network().StopNotify(watcher)
 	listen.Close()
-
-	log.Println("Waiting for active streams...")
+	closeTransport(clientDHT, h)
 	wg.Wait()
-	cleanupTransport()
 
 	log.Println("Shutdown completed.")
+
+	return nil
 }
 
-func handleClientStream(ctx context.Context, host host.Host, peer peer.ID, conn net.Conn) {
-	streamCtx, streamCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer streamCancel()
+// acceptLocalConns accepts connections on the local listener and forwards each
+// one over a dedicated tunnel stream, returning once the listener is closed and
+// all in-flight connections have finished.
+func acceptLocalConns(ctx context.Context, h host.Host, target peer.ID, listen net.Listener) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	for {
+		localConn, err := listen.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				log.Println("Local listener closed, no longer accepting connections")
+				return
+			}
+
+			log.Printf("Failed to accept local connection: %v", err)
+			continue
+		}
+
+		wg.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+			handleClientStream(ctx, h, target, conn)
+		}(localConn)
+	}
+}
+
+func handleClientStream(ctx context.Context, h host.Host, target peer.ID, conn net.Conn) {
+	defer conn.Close()
+
+	streamCtx, cancel := context.WithTimeout(ctx, streamOpenTimeout)
+	defer cancel()
 
 	// Permit opening the stream over a limited (circuit-relay) connection.
 	// Without this, libp2p refuses to open streams while the connection is
@@ -176,17 +129,14 @@ func handleClientStream(ctx context.Context, host host.Host, peer peer.ID, conn 
 	// produced a direct connection - the classic "connected but no data" case.
 	streamCtx = network.WithAllowLimitedConn(streamCtx, "mtunnel")
 
-	s, err := host.NewStream(streamCtx, peer, protocolID)
+	s, err := h.NewStream(streamCtx, target, protocolID)
 	if err != nil {
-		log.Printf("Failed to open stream to peer %s: %v", peer, err)
-		if closeErr := conn.Close(); closeErr != nil {
-			log.Printf("Error closing local connection: %v", closeErr)
-		}
+		log.Printf("Failed to open stream to peer %s: %v", target, err)
 		return
 	}
 	defer s.Close()
 
-	log.Printf("Opened stream to peer %s", peer)
+	log.Printf("Opened stream to peer %s", target)
 	pipe(s, conn)
-	log.Printf("Closed stream to peer %s", peer)
+	log.Printf("Closed stream to peer %s", target)
 }

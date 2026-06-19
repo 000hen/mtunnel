@@ -9,7 +9,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-var (
+const (
 	TOKEN      = "TOKEN"
 	DISCONNECT = "DISCONNECT"
 	CONNECTED  = "CONNECTED"

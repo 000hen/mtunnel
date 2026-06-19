@@ -11,7 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func initializePeer() host.Host {
+func initializePeer() (host.Host, error) {
 	h, err := libp2p.New(
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithStaticRelays(dht.GetDefaultBootstrapPeerAddrInfos()),
@@ -19,30 +19,36 @@ func initializePeer() host.Host {
 		libp2p.NATPortMap(),
 		libp2p.EnableAutoNATv2(),
 		libp2p.EnableNATService(),
-		// libp2p.ForceReachabilityPrivate(),
 	)
 	if err != nil {
-		sendOutputAction(OutputAction{
-			Action: ERROR,
-			Error:  fmt.Sprintf("Failed to create libp2p host: %v", err),
-		})
-		log.Fatalf("Failed to create libp2p host: %v", err)
+		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 
-	log.Println("Libp2p host created with ID:", h.ID())
+	log.Println("libp2p host created with ID:", h.ID())
 
-	return h
+	return h, nil
+}
+
+// closeTransport tears down the DHT and libp2p host, logging any errors. It is
+// safe to call during cleanup for both host and client roles.
+func closeTransport(idht *dht.IpfsDHT, h host.Host) {
+	if err := idht.Close(); err != nil {
+		log.Printf("Error closing DHT: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		log.Printf("Error closing libp2p host: %v", err)
+	}
 }
 
 func connectToPeer(ctx context.Context, host host.Host, peer peer.AddrInfo) error {
 	if err := host.Connect(ctx, peer); err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %w", peer.ID, err)
+		return fmt.Errorf("connect to peer %s: %w", peer.ID, err)
 	}
 
 	log.Println("Successfully connected to peer:", peer.ID)
-	log.Println("Connect with the address(es):")
-	for _, addr := range host.Network().ConnsToPeer(peer.ID) {
-		log.Println(" -", addr.RemoteMultiaddr().String())
+	log.Println("Connected with the address(es):")
+	for _, conn := range host.Network().ConnsToPeer(peer.ID) {
+		log.Println(" -", conn.RemoteMultiaddr().String())
 	}
 
 	return nil

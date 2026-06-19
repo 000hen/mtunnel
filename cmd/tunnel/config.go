@@ -10,6 +10,10 @@ const (
 	networkStabilizationDelay = 20 * time.Second
 	defaultLocalDialTimeout   = 10 * time.Second
 
+	// streamOpenTimeout bounds how long the client waits when opening a tunnel
+	// stream to the host (which may involve dialing/upgrading the connection).
+	streamOpenTimeout = 30 * time.Second
+
 	// DHT peer discovery retry settings. A host's address record may take a
 	// while to propagate, so the client retries the lookup before giving up.
 	dhtLookupTimeout     = 30 * time.Second
