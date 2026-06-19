@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -55,19 +56,48 @@ func connectToBootstrapPeers(ctx context.Context, h host.Host) error {
 	return nil
 }
 
-func findPeerInDHT(ctx context.Context, dhtInstance *dht.IpfsDHT, peerID peer.ID) peer.AddrInfo {
-	info, findErr := dhtInstance.FindPeer(ctx, peerID)
-	if findErr == nil {
-		log.Printf("Discovered peer %s via DHT with %d addresses", info.ID, len(info.Addrs))
-		log.Println("Addresses found via DHT:")
-		for _, a := range info.Addrs {
-			log.Println(" -", a.String())
+// findPeerInDHT looks up a peer's addresses in the DHT. The host's record may
+// not have propagated yet when the client starts, so the lookup is retried with
+// a bounded per-attempt timeout instead of failing fatally on the first miss.
+func findPeerInDHT(ctx context.Context, dhtInstance *dht.IpfsDHT, peerID peer.ID) (peer.AddrInfo, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= dhtLookupMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return peer.AddrInfo{}, err
 		}
-	} else if errors.Is(findErr, routing.ErrNotFound) {
-		log.Fatalf("Peer %s not yet available in DHT", peerID)
-	} else {
-		log.Fatalf("DHT lookup for peer %s failed: %v", peerID, findErr)
+
+		lookupCtx, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
+		info, findErr := dhtInstance.FindPeer(lookupCtx, peerID)
+		cancel()
+
+		if findErr == nil && len(info.Addrs) > 0 {
+			log.Printf("Discovered peer %s via DHT with %d addresses", info.ID, len(info.Addrs))
+			log.Println("Addresses found via DHT:")
+			for _, a := range info.Addrs {
+				log.Println(" -", a.String())
+			}
+			return info, nil
+		}
+
+		if findErr == nil {
+			lastErr = fmt.Errorf("peer %s found but no addresses available", peerID)
+		} else if errors.Is(findErr, routing.ErrNotFound) {
+			lastErr = fmt.Errorf("peer %s not yet available in DHT", peerID)
+		} else {
+			lastErr = fmt.Errorf("DHT lookup for peer %s failed: %w", peerID, findErr)
+		}
+
+		log.Printf("Peer discovery attempt %d/%d failed: %v", attempt, dhtLookupMaxAttempts, lastErr)
+
+		if attempt < dhtLookupMaxAttempts {
+			select {
+			case <-ctx.Done():
+				return peer.AddrInfo{}, ctx.Err()
+			case <-time.After(dhtLookupRetryDelay):
+			}
+		}
 	}
 
-	return info
+	return peer.AddrInfo{}, lastErr
 }

@@ -43,7 +43,17 @@ func runClient(host host.Host, token string, localPort int) {
 	}
 
 	log.Println("Routing table size:", clientDHT.RoutingTable().Size())
-	info := findPeerInDHT(dhtCtx, clientDHT, decodedToken.ID)
+	info, err := findPeerInDHT(dhtCtx, clientDHT, decodedToken.ID)
+	if err != nil {
+		dhtCancel()
+		sendOutputAction(OutputAction{
+			Action: ERROR,
+			Error:  fmt.Sprintf("Failed to discover peer %s: %v", decodedToken.ID, err),
+		})
+		_ = clientDHT.Close()
+		_ = host.Close()
+		log.Fatalf("Failed to discover peer %s: %v", decodedToken.ID, err)
+	}
 	dhtCancel()
 
 	var remoteWatcher network.Notifiee
@@ -159,6 +169,12 @@ func runClient(host host.Host, token string, localPort int) {
 func handleClientStream(ctx context.Context, host host.Host, peer peer.ID, conn net.Conn) {
 	streamCtx, streamCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer streamCancel()
+
+	// Permit opening the stream over a limited (circuit-relay) connection.
+	// Without this, libp2p refuses to open streams while the connection is
+	// relay-only, so traffic would fail whenever hole punching has not yet
+	// produced a direct connection - the classic "connected but no data" case.
+	streamCtx = network.WithAllowLimitedConn(streamCtx, "mtunnel")
 
 	s, err := host.NewStream(streamCtx, peer, protocolID)
 	if err != nil {

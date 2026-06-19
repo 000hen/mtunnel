@@ -22,8 +22,17 @@ func (w *remoteDisconnectWatcher) ListenClose(network.Network, ma.Multiaddr)    
 func (w *remoteDisconnectWatcher) Connected(network.Network, network.Conn)      {}
 func (w *remoteDisconnectWatcher) OpenedStream(network.Network, network.Stream) {}
 func (w *remoteDisconnectWatcher) ClosedStream(network.Network, network.Stream) {}
-func (w *remoteDisconnectWatcher) Disconnected(_ network.Network, conn network.Conn) {
+func (w *remoteDisconnectWatcher) Disconnected(n network.Network, conn network.Conn) {
 	if conn.RemotePeer() != w.target {
+		return
+	}
+
+	// A single connection closing does not mean the peer is gone. libp2p
+	// routinely tears down the initial (limited) relay connection once a
+	// direct connection has been established via hole punching, which would
+	// otherwise be misread as the remote peer disconnecting. Only treat the
+	// peer as disconnected when no live connection to it remains.
+	if n.Connectedness(w.target) == network.Connected {
 		return
 	}
 
