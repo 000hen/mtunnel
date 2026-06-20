@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"os"
 
@@ -57,7 +59,7 @@ func handleIOAction(ctx context.Context, sessionManager *SessionManager, request
 			return
 
 		case err := <-errChan:
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				log.Println("Input stream closed, stopping IO action handler")
 				return
 			}

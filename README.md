@@ -12,7 +12,7 @@ A lightweight reverse tunnelling binary built on top of [go-libp2p](https://gith
 
 ## Prerequisites
 
-- Go 1.24 or newer (the module uses the Go 1.24 toolchain directives)
+- Go 1.25 or newer (the upgraded go-libp2p dependencies require the Go 1.25 language version)
 - A reachable local service on the host side to forward traffic to (e.g. `localhost:8080`)
 
 ## Build

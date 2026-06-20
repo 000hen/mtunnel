@@ -15,7 +15,6 @@ func initializePeer() (host.Host, error) {
 	h, err := libp2p.New(
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithStaticRelays(dht.GetDefaultBootstrapPeerAddrInfos()),
-		libp2p.EnableRelay(),
 		libp2p.NATPortMap(),
 		libp2p.EnableAutoNATv2(),
 		libp2p.EnableNATService(),

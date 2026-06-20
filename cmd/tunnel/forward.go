@@ -12,17 +12,14 @@ import (
 // outright.
 func pipe(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
-	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		copyAndCloseWrite(a, b)
-	}()
+	})
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		copyAndCloseWrite(b, a)
-	}()
+	})
 
 	wg.Wait()
 }

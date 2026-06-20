@@ -6,7 +6,12 @@ import (
 )
 
 const (
-	protocolID                = "/mtunnel/1.0.0"
+	protocolID = "/mtunnel/1.0.0"
+
+	// networkStabilizationDelay bounds how long the host waits for a dialable
+	// (public or relay) address before announcing its token. It is an upper
+	// bound rather than a fixed wait: the host proceeds as soon as such an
+	// address appears (see waitForNetworkReady).
 	networkStabilizationDelay = 20 * time.Second
 	defaultLocalDialTimeout   = 10 * time.Second
 

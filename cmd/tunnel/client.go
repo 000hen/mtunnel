@@ -69,11 +69,9 @@ func runClient(ctx context.Context, h host.Host, token string, localPort int) er
 	})
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		acceptLocalConns(ctx, h, decodedToken.ID, listen)
-	}()
+	})
 
 	<-ctx.Done()
 	log.Println("Initiating graceful shutdown...")
@@ -109,11 +107,9 @@ func acceptLocalConns(ctx context.Context, h host.Host, target peer.ID, listen n
 			continue
 		}
 
-		wg.Add(1)
-		go func(conn net.Conn) {
-			defer wg.Done()
-			handleClientStream(ctx, h, target, conn)
-		}(localConn)
+		wg.Go(func() {
+			handleClientStream(ctx, h, target, localConn)
+		})
 	}
 }
 

@@ -28,11 +28,17 @@ func (w *remoteDisconnectWatcher) Disconnected(n network.Network, conn network.C
 	}
 
 	// A single connection closing does not mean the peer is gone. libp2p
-	// routinely tears down the initial (limited) relay connection once a
-	// direct connection has been established via hole punching, which would
-	// otherwise be misread as the remote peer disconnecting. Only treat the
-	// peer as disconnected when no live connection to it remains.
-	if n.Connectedness(w.target) == network.Connected {
+	// routinely cycles connections during hole punching: the initial limited
+	// relay connection is torn down once a direct connection is established,
+	// and a direct connection can later drop back to the relay as a fallback.
+	// Either event would otherwise be misread as the remote peer disconnecting.
+	//
+	// Connectedness reports three live states - Connected (a direct connection),
+	// Limited (only a relay/limited connection), and NotConnected. Both Connected
+	// and Limited still carry traffic (the client opens streams over limited
+	// connections via WithAllowLimitedConn), so the peer is only truly gone when
+	// no connection of either kind remains.
+	if n.Connectedness(w.target) != network.NotConnected {
 		return
 	}
 
