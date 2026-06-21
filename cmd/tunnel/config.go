@@ -1,9 +1,6 @@
 package main
 
-import (
-	"fmt"
-	"time"
-)
+import "time"
 
 const (
 	protocolID = "/mtunnel/1.0.0"
@@ -24,17 +21,10 @@ const (
 	dhtLookupTimeout     = 30 * time.Second
 	dhtLookupRetryDelay  = 5 * time.Second
 	dhtLookupMaxAttempts = 6
+
+	// udpFlowIdleTimeout bounds how long a UDP flow (one client source address
+	// and its dedicated tunnel stream) is kept alive without traffic. UDP has no
+	// connection close, so idle flows are reaped to release their stream and
+	// goroutines.
+	udpFlowIdleTimeout = 60 * time.Second
 )
-
-var supportedNetworks = map[string]struct{}{
-	"tcp": {},
-	"udp": {},
-}
-
-func validateNetworkType(network string) error {
-	if _, ok := supportedNetworks[network]; ok {
-		return nil
-	}
-
-	return fmt.Errorf("unsupported network type %q", network)
-}

@@ -84,12 +84,10 @@ func handleIOAction(ctx context.Context, sessionManager *SessionManager, request
 					log.Println("DISCONNECT action ignored: session management not available in this mode")
 					continue
 				}
-				sessionManager.RemoveSession(input.SessionId, true)
-				log.Printf("Session %s disconnected successfully", input.SessionId)
-				sendOutputAction(OutputAction{
-					Action:    DISCONNECT,
-					SessionId: input.SessionId,
-				})
+				// RemoveSession emits the DISCONNECT event itself (once), so we
+				// do not send another here.
+				sessionManager.RemoveSession(input.SessionId)
+				log.Printf("Disconnect requested for session %s", input.SessionId)
 
 			case SHUTDOWN:
 				log.Println("Shutdown action received from stdin")

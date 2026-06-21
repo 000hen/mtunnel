@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
+	"net"
 	"sync"
 )
 
@@ -27,7 +29,7 @@ func pipe(a, b io.ReadWriteCloser) {
 // copyAndCloseWrite copies src into dst, then signals end-of-stream on dst by
 // half-closing the write side (falling back to a full close).
 func copyAndCloseWrite(dst, src io.ReadWriteCloser) {
-	if _, err := io.Copy(dst, src); err != nil {
+	if _, err := io.Copy(dst, src); err != nil && !isBenignForwardErr(err) {
 		log.Printf("Forwarding error: %v", err)
 	}
 
@@ -36,4 +38,11 @@ func copyAndCloseWrite(dst, src io.ReadWriteCloser) {
 	} else {
 		_ = dst.Close()
 	}
+}
+
+// isBenignForwardErr reports whether a forwarding error is the expected result
+// of either side closing the connection during normal operation or shutdown,
+// and therefore not worth logging.
+func isBenignForwardErr(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }

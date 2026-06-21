@@ -23,6 +23,12 @@ func runClient(ctx context.Context, h host.Host, token string, localPort int) er
 		return err
 	}
 
+	t, err := transportFor(decodedToken.Network)
+	if err != nil {
+		_ = h.Close()
+		return err
+	}
+
 	// The DHT shares the client's lifetime: it is created with ctx and closed
 	// during cleanup, so it stays usable for the whole discovery phase.
 	clientDHT, err := setupDHT(ctx, h, false)
@@ -35,7 +41,7 @@ func runClient(ctx context.Context, h host.Host, token string, localPort int) er
 
 	info, err := findPeerInDHT(ctx, clientDHT, decodedToken.ID)
 	if err != nil {
-		closeTransport(clientDHT, h)
+		closeLibp2p(clientDHT, h)
 		return fmt.Errorf("discover peer %s: %w", decodedToken.ID, err)
 	}
 
@@ -46,7 +52,7 @@ func runClient(ctx context.Context, h host.Host, token string, localPort int) er
 	go handleIOAction(ctx, nil, requestShutdown)
 
 	if err := connectToPeer(ctx, h, info); err != nil {
-		closeTransport(clientDHT, h)
+		closeLibp2p(clientDHT, h)
 		return fmt.Errorf("connect to peer %s: %w", decodedToken.ID, err)
 	}
 
@@ -54,33 +60,31 @@ func runClient(ctx context.Context, h host.Host, token string, localPort int) er
 	watcher := newRemoteDisconnectWatcher(decodedToken.ID, requestShutdown)
 	h.Network().Notify(watcher)
 
-	listen, err := net.Listen(decodedToken.Network, fmt.Sprintf("localhost:%d", localPort))
+	forwarder, err := t.listenLocal(ctx, h, decodedToken.ID, localPort)
 	if err != nil {
 		h.Network().StopNotify(watcher)
-		closeTransport(clientDHT, h)
+		closeLibp2p(clientDHT, h)
 		return fmt.Errorf("listen on local port %d: %w", localPort, err)
 	}
 
-	log.Printf("Listening for local connections on %s", listen.Addr().String())
+	log.Printf("Listening for local connections on %s", forwarder.addr)
 	sendOutputAction(OutputAction{
 		Action:    CONNECTED,
 		SessionId: h.ID(),
-		Port:      listen.Addr().(*net.TCPAddr).Port,
+		Port:      addrPort(forwarder.addr),
 	})
 
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		acceptLocalConns(ctx, h, decodedToken.ID, listen)
-	})
+	wg.Go(forwarder.serve)
 
 	<-ctx.Done()
 	log.Println("Initiating graceful shutdown...")
 
-	// Stop watching, stop accepting, then close the transport (which unblocks
-	// any in-flight pipes) before waiting for the accept loop to drain.
+	// Stop watching, stop accepting, then close the libp2p stack (which unblocks
+	// any in-flight pipes) before waiting for the forwarder to drain.
 	h.Network().StopNotify(watcher)
-	listen.Close()
-	closeTransport(clientDHT, h)
+	_ = forwarder.close()
+	closeLibp2p(clientDHT, h)
 	wg.Wait()
 
 	log.Println("Shutdown completed.")
@@ -116,16 +120,7 @@ func acceptLocalConns(ctx context.Context, h host.Host, target peer.ID, listen n
 func handleClientStream(ctx context.Context, h host.Host, target peer.ID, conn net.Conn) {
 	defer conn.Close()
 
-	streamCtx, cancel := context.WithTimeout(ctx, streamOpenTimeout)
-	defer cancel()
-
-	// Permit opening the stream over a limited (circuit-relay) connection.
-	// Without this, libp2p refuses to open streams while the connection is
-	// relay-only, so traffic would fail whenever hole punching has not yet
-	// produced a direct connection - the classic "connected but no data" case.
-	streamCtx = network.WithAllowLimitedConn(streamCtx, "mtunnel")
-
-	s, err := h.NewStream(streamCtx, target, protocolID)
+	s, err := openTunnelStream(ctx, h, target)
 	if err != nil {
 		log.Printf("Failed to open stream to peer %s: %v", target, err)
 		return
@@ -135,4 +130,17 @@ func handleClientStream(ctx context.Context, h host.Host, target peer.ID, conn n
 	log.Printf("Opened stream to peer %s", target)
 	pipe(s, conn)
 	log.Printf("Closed stream to peer %s", target)
+}
+
+// openTunnelStream opens a tunnel stream to the host. It permits opening over a
+// limited (circuit-relay) connection: without this, libp2p refuses to open
+// streams while the connection is relay-only, so traffic would fail whenever
+// hole punching has not yet produced a direct connection - the classic
+// "connected but no data" case.
+func openTunnelStream(ctx context.Context, h host.Host, target peer.ID) (network.Stream, error) {
+	streamCtx, cancel := context.WithTimeout(ctx, streamOpenTimeout)
+	defer cancel()
+
+	streamCtx = network.WithAllowLimitedConn(streamCtx, "mtunnel")
+	return h.NewStream(streamCtx, target, protocolID)
 }

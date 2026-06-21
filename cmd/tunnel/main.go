@@ -12,12 +12,12 @@ import (
 
 func main() {
 	port := flag.Int("port", 0, "Port to forward, in client mode this is the local port to connect to")
-	network := flag.String("network", "tcp", "Network type for local connection: tcp or udp")
+	network := flag.String("network", "tcp", "Network type for the forwarded connection: tcp or udp")
 	token := flag.String("token", "", "Connection token for client mode")
 
 	flag.Parse()
 
-	if err := validateNetworkType(*network); err != nil {
+	if _, err := transportFor(*network); err != nil {
 		log.Fatalf("Invalid network type: %v", err)
 	}
 

@@ -28,9 +28,9 @@ func initializePeer() (host.Host, error) {
 	return h, nil
 }
 
-// closeTransport tears down the DHT and libp2p host, logging any errors. It is
+// closeLibp2p tears down the DHT and libp2p host, logging any errors. It is
 // safe to call during cleanup for both host and client roles.
-func closeTransport(idht *dht.IpfsDHT, h host.Host) {
+func closeLibp2p(idht *dht.IpfsDHT, h host.Host) {
 	if err := idht.Close(); err != nil {
 		log.Printf("Error closing DHT: %v", err)
 	}

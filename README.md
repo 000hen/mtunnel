@@ -36,7 +36,7 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 ```
 
 - `-port` is the local port on the host that should receive forwarded traffic.
-- `-network` controls the socket type (`tcp` default, or `udp`).
+- `-network` controls the socket type (`tcp` default, or `udp`). UDP is carried as length-prefixed datagrams over one tunnel stream per source flow, with idle flows reaped automatically.
 - The process prints a base64-encoded connection token to stdout and also emits a JSON event for automation. Share this token with clients.
 
 ### Client mode (consume a forwarded service)
@@ -48,7 +48,7 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 
 - `-port` is the local listener port. Set `0` to let the OS pick a free port (the program prints the chosen port).
 - `-network` must match the host's setting.
-- Once connected, any TCP (or UDP) client hitting the local port will tunnel traffic to the host's service.
+- Once connected, any TCP or UDP client hitting the local port will tunnel traffic to the host's service.
 
 ### Monitoring and session control (optional)
 

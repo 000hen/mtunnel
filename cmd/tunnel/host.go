@@ -19,6 +19,12 @@ func runHost(ctx context.Context, h host.Host, networkType string, forwardPort i
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	t, err := transportFor(networkType)
+	if err != nil {
+		_ = h.Close()
+		return err
+	}
+
 	requestShutdown := func(reason string) {
 		log.Printf("Shutdown requested: %s", reason)
 		cancel()
@@ -33,31 +39,36 @@ func runHost(ctx context.Context, h host.Host, networkType string, forwardPort i
 	log.Println("Waiting for network stabilization...")
 	waitForNetworkReady(ctx, h, networkStabilizationDelay)
 	if ctx.Err() != nil {
-		closeTransport(idht, h)
+		closeLibp2p(idht, h)
 		return nil
 	}
 
 	logHostAddrs(h)
 
-	encodedToken, err := ConnToken{Network: networkType, ID: h.ID()}.Encode()
+	encodedToken, err := ConnToken{Network: t.network(), ID: h.ID()}.Encode()
 	if err != nil {
-		closeTransport(idht, h)
+		closeLibp2p(idht, h)
 		return err
 	}
-	announceToken(encodedToken)
-
 	session := NewSessionManager(h.Network())
 	var wg sync.WaitGroup
 
+	addr := fmt.Sprintf("localhost:%d", forwardPort)
 	// Register the stream handler before announcing readiness so that an eager
 	// client cannot connect during a window where no handler is installed.
 	h.SetStreamHandler(protocolID, func(s network.Stream) {
 		peer := s.Conn().RemotePeer()
-		session.AddSession(peer, s.Conn())
-		defer session.RemoveSession(peer, false)
+		if !session.BeginStream(peer, s.Conn()) {
+			// The host is shutting down and no longer serving streams.
+			_ = s.Reset()
+			return
+		}
+		defer session.EndStream(peer)
 
-		handleHostStream(s, networkType, forwardPort)
+		handleHostStream(ctx, t, s, addr)
 	})
+
+	announceToken(encodedToken)
 
 	wg.Go(func() {
 		handleIOAction(ctx, session, requestShutdown)
@@ -66,13 +77,14 @@ func runHost(ctx context.Context, h host.Host, networkType string, forwardPort i
 	<-ctx.Done()
 	log.Println("Initiating graceful shutdown...")
 
-	// Stop accepting new streams, tear down active ones, then wait for the IO
-	// handler to return before closing the transport.
+	// Stop accepting new streams, then reset active ones and wait for their
+	// handlers to drain (session.Shutdown) and for the IO handler to return (wg)
+	// before closing the libp2p stack.
 	h.RemoveStreamHandler(protocolID)
-	session.ForceCloseAllSessions()
+	session.Shutdown()
 	wg.Wait()
 
-	closeTransport(idht, h)
+	closeLibp2p(idht, h)
 	log.Println("Shutdown completed.")
 
 	return nil
@@ -147,14 +159,16 @@ func hasReachableAddr(h host.Host) bool {
 	return false
 }
 
-// handleHostStream forwards a single inbound tunnel stream to the local service.
-func handleHostStream(s network.Stream, networkType string, forwardPort int) {
+// handleHostStream forwards a single inbound tunnel stream to the local service
+// using the transport's network semantics. The dial honours ctx so a slow local
+// service does not delay shutdown.
+func handleHostStream(ctx context.Context, t transport, s network.Stream, addr string) {
 	remote := s.Conn().RemotePeer()
 	log.Println("New stream opened from:", remote)
 	defer s.Close()
 
-	addr := fmt.Sprintf("localhost:%d", forwardPort)
-	localConn, err := net.DialTimeout(networkType, addr, defaultLocalDialTimeout)
+	dialer := net.Dialer{Timeout: defaultLocalDialTimeout}
+	localConn, err := dialer.DialContext(ctx, t.network(), addr)
 	if err != nil {
 		log.Printf("Failed to connect to local service on %s: %v", addr, err)
 		return
@@ -162,7 +176,7 @@ func handleHostStream(s network.Stream, networkType string, forwardPort int) {
 	defer localConn.Close()
 
 	log.Printf("Connected to local service on %s", addr)
-	pipe(s, localConn)
+	t.forward(s, localConn)
 	log.Println("Stream closed for peer:", remote)
 }
 
