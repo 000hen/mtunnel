@@ -49,7 +49,7 @@ func serveLocal(ctx context.Context, opener transport.Opener, conn *net.UDPConn)
 
 		if err := writeDatagram(flow.stream, buf[:n]); err != nil {
 			log.Printf("Failed to forward datagram from %s: %v", addr, err)
-			flows.remove(addr)
+			flows.remove(flow)
 		}
 	}
 }
@@ -135,7 +135,7 @@ func (t *flowTable) get(ctx context.Context, addr net.Addr) (*flow, error) {
 // pumpStreamToLocal copies datagrams arriving on the flow's stream back to the
 // originating UDP client. It returns when the stream ends, removing the flow.
 func (t *flowTable) pumpStreamToLocal(f *flow) {
-	defer t.remove(f.addr)
+	defer t.remove(f)
 
 	buf := make([]byte, maxDatagramSize)
 	for {
@@ -154,21 +154,24 @@ func (t *flowTable) pumpStreamToLocal(f *flow) {
 	}
 }
 
-// remove drops a flow and resets its stream. It is idempotent, so the reaper, the
-// forward path, and the reverse pump can all call it for the same flow.
-func (t *flowTable) remove(addr net.Addr) {
-	key := addr.String()
+// remove drops f and resets its stream, but only if f is still the flow
+// registered for its address. The identity check matters because a reverse pump
+// can run this (via its defer) after its flow was already reaped and a new flow
+// was registered under the same source address; keying on the address alone, the
+// stale pump would evict and reset the live replacement. It is idempotent, so the
+// forward path and the reverse pump can both call it for the same flow.
+func (t *flowTable) remove(f *flow) {
+	key := f.addr.String()
 
 	t.mu.Lock()
-	f, ok := t.flows[key]
-	if ok {
-		delete(t.flows, key)
+	if t.flows[key] != f {
+		t.mu.Unlock()
+		return
 	}
+	delete(t.flows, key)
 	t.mu.Unlock()
 
-	if ok {
-		f.stream.Reset()
-	}
+	f.stream.Reset()
 }
 
 // reap periodically expires flows that have seen no traffic within

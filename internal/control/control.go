@@ -83,15 +83,18 @@ func (e *Emitter) Emit(out Output) {
 	}
 }
 
-// Handle reads control requests from in and dispatches them until in is exhausted
-// or ctx is cancelled. sessions may be nil when session management is unavailable
-// (client mode), in which case LIST and DISCONNECT are ignored. A SHUTDOWN request
-// invokes requestShutdown and returns.
+// Handle reads control requests from in and dispatches them until in is exhausted,
+// a decode error occurs, or ctx is cancelled. sessions may be nil when session
+// management is unavailable (client mode), in which case LIST and DISCONNECT are
+// ignored. A SHUTDOWN request invokes requestShutdown and returns.
 func Handle(ctx context.Context, in io.Reader, e *Emitter, sessions Sessions, requestShutdown func(reason string)) {
 	decoder := json.NewDecoder(in)
 
-	inputChan := make(chan Input)
-	errChan := make(chan error)
+	// Buffered so the reader goroutine's final send never blocks once this function
+	// has returned (e.g. on ctx cancellation), letting that goroutine exit on its
+	// next decode instead of leaking forever on the send.
+	inputChan := make(chan Input, 1)
+	errChan := make(chan error, 1)
 
 	go func() {
 		for {
@@ -115,8 +118,12 @@ func Handle(ctx context.Context, in io.Reader, e *Emitter, sessions Sessions, re
 				log.Println("Input stream closed, stopping IO action handler")
 				return
 			}
-			log.Printf("Error decoding input action: %v", err)
-			continue
+			// The reader goroutine has already exited on this error, and a
+			// json.Decoder cannot resync after a malformed value, so no further
+			// input can arrive. Stop the handler rather than looping on a channel
+			// that will never receive again.
+			log.Printf("Error decoding input action, stopping IO action handler: %v", err)
+			return
 
 		case input := <-inputChan:
 			switch input.Action {
