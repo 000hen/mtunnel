@@ -1,4 +1,4 @@
-package main
+package udp
 
 import (
 	"context"
@@ -9,19 +9,22 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
+	"mtunnel-libp2p/internal/transport"
 )
 
-// serveLocalUDP forwards datagrams between a local UDP socket and the host. UDP
-// is connectionless, so the single socket receives traffic from many remote
+// flowIdleTimeout bounds how long a UDP flow (one client source address and its
+// dedicated tunnel stream) is kept alive without traffic. UDP has no connection
+// close, so idle flows are reaped to release their stream and goroutines.
+const flowIdleTimeout = 60 * time.Second
+
+// serveLocal forwards datagrams between a local UDP socket and the host. UDP is
+// connectionless, so the single socket receives traffic from many remote
 // addresses; each distinct source address is mapped to its own tunnel stream (a
 // "flow") so the host can dial and reply to it independently, mirroring the
 // one-stream-per-connection model used for TCP. It returns once the socket is
 // closed and every flow has drained.
-func serveLocalUDP(ctx context.Context, h host.Host, target peer.ID, conn *net.UDPConn) {
-	flows := newUDPFlowTable(h, target, conn)
+func serveLocal(ctx context.Context, opener transport.Opener, conn *net.UDPConn) {
+	flows := newFlowTable(opener, conn)
 	defer flows.closeAll()
 
 	flows.wg.Go(func() { flows.reap(ctx) })
@@ -51,55 +54,53 @@ func serveLocalUDP(ctx context.Context, h host.Host, target peer.ID, conn *net.U
 	}
 }
 
-// udpFlow is a single client source address and the tunnel stream that carries
-// its datagrams in both directions.
-type udpFlow struct {
-	stream network.Stream
+// flow is a single client source address and the tunnel stream that carries its
+// datagrams in both directions.
+type flow struct {
+	stream transport.Stream
 	addr   net.Addr
-	// lastActivity is the UnixNano timestamp of the most recent datagram in
-	// either direction, used by the reaper to expire idle flows.
+	// lastActivity is the UnixNano timestamp of the most recent datagram in either
+	// direction, used by the reaper to expire idle flows.
 	lastActivity atomic.Int64
 }
 
-func (f *udpFlow) touch() {
+func (f *flow) touch() {
 	f.lastActivity.Store(time.Now().UnixNano())
 }
 
-// udpFlowTable tracks the live UDP flows for one local socket. Idle flows are
-// expired by a reaper goroutine that serveLocalUDP starts; closeAll stops the
+// flowTable tracks the live UDP flows for one local socket. Idle flows are
+// expired by a reaper goroutine that serveLocal starts; closeAll stops the
 // reaper, tears down every flow, and waits for their goroutines.
-type udpFlowTable struct {
-	h      host.Host
-	target peer.ID
+type flowTable struct {
+	opener transport.Opener
 	conn   *net.UDPConn
 
 	mu     sync.Mutex
-	flows  map[string]*udpFlow
+	flows  map[string]*flow
 	closed bool
 
 	done chan struct{}  // closed by closeAll to stop the reaper
 	wg   sync.WaitGroup // reverse pumps + reaper
 }
 
-func newUDPFlowTable(h host.Host, target peer.ID, conn *net.UDPConn) *udpFlowTable {
-	return &udpFlowTable{
-		h:      h,
-		target: target,
+func newFlowTable(opener transport.Opener, conn *net.UDPConn) *flowTable {
+	return &flowTable{
+		opener: opener,
 		conn:   conn,
-		flows:  make(map[string]*udpFlow),
+		flows:  make(map[string]*flow),
 		done:   make(chan struct{}),
 	}
 }
 
-// get returns the flow for addr, opening a tunnel stream and starting its
-// reverse pump on first use. The flow is touched under the lock so a concurrent
-// reaper cannot expire it between lookup and the caller's write.
+// get returns the flow for addr, opening a tunnel stream and starting its reverse
+// pump on first use. The flow is touched under the lock so a concurrent reaper
+// cannot expire it between lookup and the caller's write.
 //
-// Only serveLocalUDP's single read loop calls get, so holding the lock across
-// NewStream cannot block a competing get - it only briefly delays the reaper.
-// NewStream is fast in the common case (the client is already connected to the
+// Only serveLocal's single read loop calls get, so holding the lock across
+// OpenStream cannot block a competing get - it only briefly delays the reaper.
+// OpenStream is fast in the common case (the client is already connected to the
 // host), and ctx is cancelled on shutdown to unblock it.
-func (t *udpFlowTable) get(ctx context.Context, addr net.Addr) (*udpFlow, error) {
+func (t *flowTable) get(ctx context.Context, addr net.Addr) (*flow, error) {
 	key := addr.String()
 
 	t.mu.Lock()
@@ -114,12 +115,12 @@ func (t *udpFlowTable) get(ctx context.Context, addr net.Addr) (*udpFlow, error)
 		return nil, errors.New("udp forwarder is shutting down")
 	}
 
-	stream, err := openTunnelStream(ctx, t.h, t.target)
+	stream, err := t.opener.OpenStream(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	f := &udpFlow{stream: stream, addr: addr}
+	f := &flow{stream: stream, addr: addr}
 	f.touch()
 	t.flows[key] = f
 	log.Printf("Opened UDP flow for %s", addr)
@@ -133,7 +134,7 @@ func (t *udpFlowTable) get(ctx context.Context, addr net.Addr) (*udpFlow, error)
 
 // pumpStreamToLocal copies datagrams arriving on the flow's stream back to the
 // originating UDP client. It returns when the stream ends, removing the flow.
-func (t *udpFlowTable) pumpStreamToLocal(f *udpFlow) {
+func (t *flowTable) pumpStreamToLocal(f *flow) {
 	defer t.remove(f.addr)
 
 	buf := make([]byte, maxDatagramSize)
@@ -153,9 +154,9 @@ func (t *udpFlowTable) pumpStreamToLocal(f *udpFlow) {
 	}
 }
 
-// remove drops a flow and resets its stream. It is idempotent, so the reaper,
-// the forward path, and the reverse pump can all call it for the same flow.
-func (t *udpFlowTable) remove(addr net.Addr) {
+// remove drops a flow and resets its stream. It is idempotent, so the reaper, the
+// forward path, and the reverse pump can all call it for the same flow.
+func (t *flowTable) remove(addr net.Addr) {
 	key := addr.String()
 
 	t.mu.Lock()
@@ -171,11 +172,11 @@ func (t *udpFlowTable) remove(addr net.Addr) {
 }
 
 // reap periodically expires flows that have seen no traffic within
-// udpFlowIdleTimeout, releasing their stream and reverse-pump goroutine. UDP has
-// no connection close, so without this a transient client would leak a flow. It
+// flowIdleTimeout, releasing their stream and reverse-pump goroutine. UDP has no
+// connection close, so without this a transient client would leak a flow. It
 // returns when ctx is cancelled or closeAll signals shutdown.
-func (t *udpFlowTable) reap(ctx context.Context) {
-	ticker := time.NewTicker(udpFlowIdleTimeout / 2)
+func (t *flowTable) reap(ctx context.Context) {
+	ticker := time.NewTicker(flowIdleTimeout / 2)
 	defer ticker.Stop()
 
 	for {
@@ -190,11 +191,11 @@ func (t *udpFlowTable) reap(ctx context.Context) {
 	}
 }
 
-func (t *udpFlowTable) removeIdle() {
-	cutoff := time.Now().Add(-udpFlowIdleTimeout).UnixNano()
+func (t *flowTable) removeIdle() {
+	cutoff := time.Now().Add(-flowIdleTimeout).UnixNano()
 
 	t.mu.Lock()
-	var idle []*udpFlow
+	var idle []*flow
 	for key, f := range t.flows {
 		if f.lastActivity.Load() < cutoff {
 			delete(t.flows, key)
@@ -213,7 +214,7 @@ func (t *udpFlowTable) removeIdle() {
 // reverse pumps to finish. The closed flag (set under the lock) stops get from
 // starting new pumps, so the final Wait cannot race a late Add. Streams are reset
 // outside the lock so the pumps' own remove calls do not deadlock against it.
-func (t *udpFlowTable) closeAll() {
+func (t *flowTable) closeAll() {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -222,11 +223,11 @@ func (t *udpFlowTable) closeAll() {
 	t.closed = true
 	close(t.done)
 
-	remaining := make([]*udpFlow, 0, len(t.flows))
+	remaining := make([]*flow, 0, len(t.flows))
 	for _, f := range t.flows {
 		remaining = append(remaining, f)
 	}
-	t.flows = make(map[string]*udpFlow)
+	t.flows = make(map[string]*flow)
 	t.mu.Unlock()
 
 	for _, f := range remaining {
@@ -234,45 +235,4 @@ func (t *udpFlowTable) closeAll() {
 	}
 
 	t.wg.Wait()
-}
-
-// pipeDatagrams forwards datagrams in both directions between a tunnel stream and
-// a connected UDP socket on the host side. Unlike pipe (which streams raw bytes
-// for TCP), each direction preserves datagram boundaries via the length-prefix
-// framing. It returns once either side fails; closing one endpoint unblocks the
-// other (a connected UDP socket never reaches EOF on its own).
-func pipeDatagrams(s network.Stream, conn net.Conn) {
-	var wg sync.WaitGroup
-
-	wg.Go(func() {
-		// stream -> local UDP service
-		buf := make([]byte, maxDatagramSize)
-		for {
-			n, err := readDatagram(s, buf)
-			if err != nil {
-				break
-			}
-			if _, err := conn.Write(buf[:n]); err != nil {
-				break
-			}
-		}
-		_ = conn.Close()
-	})
-
-	wg.Go(func() {
-		// local UDP service -> stream
-		buf := make([]byte, maxDatagramSize)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				break
-			}
-			if err := writeDatagram(s, buf[:n]); err != nil {
-				break
-			}
-		}
-		_ = s.Reset()
-	})
-
-	wg.Wait()
 }

@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"log"
@@ -8,6 +8,8 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+// remoteDisconnectWatcher shuts the client down when its target host goes away
+// entirely. It implements network.Notifiee.
 type remoteDisconnectWatcher struct {
 	target peer.ID
 	notify func(string)
@@ -27,17 +29,17 @@ func (w *remoteDisconnectWatcher) Disconnected(n network.Network, conn network.C
 		return
 	}
 
-	// A single connection closing does not mean the peer is gone. libp2p
-	// routinely cycles connections during hole punching: the initial limited
-	// relay connection is torn down once a direct connection is established,
-	// and a direct connection can later drop back to the relay as a fallback.
-	// Either event would otherwise be misread as the remote peer disconnecting.
+	// A single connection closing does not mean the peer is gone. libp2p routinely
+	// cycles connections during hole punching: the initial limited relay connection
+	// is torn down once a direct connection is established, and a direct connection
+	// can later drop back to the relay as a fallback. Either event would otherwise
+	// be misread as the remote peer disconnecting.
 	//
 	// Connectedness reports three live states - Connected (a direct connection),
 	// Limited (only a relay/limited connection), and NotConnected. Both Connected
 	// and Limited still carry traffic (the client opens streams over limited
-	// connections via WithAllowLimitedConn), so the peer is only truly gone when
-	// no connection of either kind remains.
+	// connections via WithAllowLimitedConn), so the peer is only truly gone when no
+	// connection of either kind remains.
 	if n.Connectedness(w.target) != network.NotConnected {
 		return
 	}

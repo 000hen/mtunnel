@@ -1,4 +1,4 @@
-package main
+package tcp
 
 import (
 	"errors"
@@ -40,9 +40,9 @@ func copyAndCloseWrite(dst, src io.ReadWriteCloser) {
 	}
 }
 
-// isBenignForwardErr reports whether a forwarding error is the expected result
-// of either side closing the connection during normal operation or shutdown,
-// and therefore not worth logging.
+// isBenignForwardErr reports whether a forwarding error is the expected result of
+// either side closing the connection during normal operation or shutdown, and
+// therefore not worth logging.
 func isBenignForwardErr(err error) bool {
 	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }

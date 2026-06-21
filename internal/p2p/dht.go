@@ -1,4 +1,4 @@
-package main
+package p2p
 
 import (
 	"context"
@@ -13,7 +13,19 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 )
 
-func setupDHT(ctx context.Context, h host.Host, asServer bool) (*dht.IpfsDHT, error) {
+const (
+	// DHT peer discovery retry settings. A host's address record may take a while
+	// to propagate, so the client retries the lookup before giving up.
+	dhtLookupTimeout     = 30 * time.Second
+	dhtLookupRetryDelay  = 5 * time.Second
+	dhtLookupMaxAttempts = 6
+)
+
+// NewDHT creates and bootstraps a Kademlia DHT for h. asServer selects
+// ModeAutoServer (host role) over ModeClient (client role). It also kicks off
+// connections to the default bootstrap peers, logging but not failing on
+// individual connection errors.
+func NewDHT(ctx context.Context, h host.Host, asServer bool) (*dht.IpfsDHT, error) {
 	mode := dht.ModeClient
 	if asServer {
 		mode = dht.ModeAutoServer
@@ -56,10 +68,10 @@ func connectToBootstrapPeers(ctx context.Context, h host.Host) error {
 	return nil
 }
 
-// findPeerInDHT looks up a peer's addresses in the DHT. The host's record may
-// not have propagated yet when the client starts, so the lookup is retried with
-// a bounded per-attempt timeout instead of failing fatally on the first miss.
-func findPeerInDHT(ctx context.Context, dhtInstance *dht.IpfsDHT, peerID peer.ID) (peer.AddrInfo, error) {
+// FindPeer looks up a peer's addresses in the DHT. The host's record may not have
+// propagated yet when the client starts, so the lookup is retried with a bounded
+// per-attempt timeout instead of failing fatally on the first miss.
+func FindPeer(ctx context.Context, dhtInstance *dht.IpfsDHT, peerID peer.ID) (peer.AddrInfo, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= dhtLookupMaxAttempts; attempt++ {
