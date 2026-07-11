@@ -3,7 +3,13 @@
 // together.
 package tunnel
 
-import "time"
+import (
+	"time"
+
+	"mtunnel-libp2p/internal/p2p"
+
+	"github.com/libp2p/go-libp2p/core/metrics"
+)
 
 const (
 	// networkStabilizationDelay bounds how long the host waits for a dialable
@@ -16,3 +22,9 @@ const (
 	// service for an inbound tunnel stream.
 	defaultLocalDialTimeout = 10 * time.Second
 )
+
+// Options carries policies selected at the CLI boundary into orchestration.
+type Options struct {
+	P2P       p2p.Config
+	Bandwidth *metrics.BandwidthCounter
+}

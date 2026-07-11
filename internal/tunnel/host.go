@@ -20,11 +20,11 @@ import (
 // forwards each inbound tunnel stream to the local service on forwardPort. It
 // returns when ctx is cancelled and shutdown completes. RunHost takes ownership of
 // h and closes it before returning.
-func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, networkType string, forwardPort int) error {
+func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, networkType string, forwardPort int, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	t, err := transportFor(networkType)
+	t, err := transportFor(networkType, opts.P2P.Diagnostic)
 	if err != nil {
 		_ = h.Close()
 		return err
@@ -35,7 +35,7 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 		cancel()
 	}
 
-	idht, err := p2p.NewDHT(ctx, h, true)
+	idht, err := p2p.NewDHT(ctx, h, true, opts.P2P.DHTMode)
 	if err != nil {
 		_ = h.Close()
 		return fmt.Errorf("create DHT: %w", err)
@@ -62,6 +62,7 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 	// Register the stream handler before announcing readiness so that an eager
 	// client cannot connect during a window where no handler is installed.
 	h.SetStreamHandler(p2p.ProtocolID, func(s network.Stream) {
+		p2p.LogStreamPath("accepted", s, opts.P2P.Diagnostic)
 		remote := s.Conn().RemotePeer()
 		if !session.BeginStream(remote, s.Conn()) {
 			// The host is shutting down and no longer serving streams.
@@ -74,6 +75,9 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 	})
 
 	announceToken(emitter, encodedToken)
+	if opts.P2P.Diagnostic {
+		go p2p.StartDiagnostics(ctx, h, idht, "", opts.Bandwidth)
+	}
 
 	wg.Go(func() {
 		control.Handle(ctx, os.Stdin, emitter, session, requestShutdown)

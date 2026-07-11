@@ -50,6 +50,30 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 - `-network` must match the host's setting.
 - Once connected, any TCP or UDP client hitting the local port will tunnel traffic to the host's service.
 
+### Connection stability and diagnostics
+
+Latency-sensitive TCP traffic defaults to `-connection-mode direct-first`: a
+new application stream waits up to `-direct-timeout` for a direct libp2p
+connection, then records an explicit relay fallback. Existing streams never
+migrate between relay and direct connections.
+
+Useful controlled-test flags:
+
+- `-connection-mode direct-only|direct-first|relay-only`
+- `-transport default|quic|tcp|webrtc`
+- `-dht-mode close-after-connect|no-refresh|current` (client role)
+- `-direct-timeout 15s`
+- `-relays <multiaddr>,<multiaddr>` selects a small dedicated server relay set;
+  without it the server bounds fallback candidates to three bootstrap peers.
+- `-diagnostic` emits JSON structured logs to stderr every 10 seconds, plus one
+  path record for every opened or accepted tunnel stream.
+
+The recommended production baseline is `direct-first`, `default` transport,
+and `close-after-connect`. Use `direct-only` when a relayed game session is less
+useful than a clear connection failure. See
+[`docs/connection-stability.md`](docs/connection-stability.md) for the evidence,
+test matrix, and exact long-run procedure.
+
 ### Monitoring and session control (optional)
 
 Host mode reads JSON messages from stdin and writes JSON status events to stdout, enabling external supervisors to manage active peers:
@@ -62,7 +86,8 @@ Each event includes the action name plus auxiliary fields such as `token`, `addr
 ## Development
 
 - Use `go fmt ./...` and `go test ./...` before submitting changes (no tests are defined yet, but the command ensures everything builds).
-- Logs default to stdout; wrap the binary in a service manager if long-running.
+- Control events use stdout. Diagnostic JSON logs use stderr so test runs can
+  capture them independently.
 
 ## License
 

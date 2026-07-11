@@ -25,13 +25,18 @@ const (
 // ModeAutoServer (host role) over ModeClient (client role). It also kicks off
 // connections to the default bootstrap peers, logging but not failing on
 // individual connection errors.
-func NewDHT(ctx context.Context, h host.Host, asServer bool) (*dht.IpfsDHT, error) {
+func NewDHT(ctx context.Context, h host.Host, asServer bool, clientMode DHTMode) (*dht.IpfsDHT, error) {
 	mode := dht.ModeClient
 	if asServer {
 		mode = dht.ModeAutoServer
 	}
 
-	dhtInstance, err := dht.New(ctx, h, dht.Mode(mode))
+	opts := []dht.Option{dht.Mode(mode)}
+	if !asServer && clientMode == DHTNoRefresh {
+		opts = append(opts, dht.DisableAutoRefresh())
+	}
+
+	dhtInstance, err := dht.New(ctx, h, opts...)
 	if err != nil {
 		return nil, err
 	}

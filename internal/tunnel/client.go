@@ -19,7 +19,7 @@ import (
 // local listener on localPort, and forwards its traffic to the host over tunnel
 // streams. It returns when ctx is cancelled and shutdown completes. RunClient takes
 // ownership of h and closes it before returning.
-func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token string, localPort int) error {
+func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token string, localPort int, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -29,7 +29,7 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 		return err
 	}
 
-	t, err := transportFor(decodedToken.Network)
+	t, err := transportFor(decodedToken.Network, opts.P2P.Diagnostic)
 	if err != nil {
 		_ = h.Close()
 		return err
@@ -37,7 +37,7 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 
 	// The DHT shares the client's lifetime: it is created with ctx and closed during
 	// cleanup, so it stays usable for the whole discovery phase.
-	clientDHT, err := p2p.NewDHT(ctx, h, false)
+	clientDHT, err := p2p.NewDHT(ctx, h, false, opts.P2P.DHTMode)
 	if err != nil {
 		_ = h.Close()
 		return fmt.Errorf("bootstrap DHT: %w", err)
@@ -57,16 +57,28 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 	}
 	go control.Handle(ctx, os.Stdin, emitter, nil, requestShutdown)
 
-	if err := p2p.Connect(ctx, h, info); err != nil {
+	if err := p2p.Connect(ctx, h, info, opts.P2P); err != nil {
 		p2p.Close(clientDHT, h)
 		return fmt.Errorf("connect to peer %s: %w", decodedToken.ID, err)
+	}
+
+	if opts.P2P.DHTMode == p2p.DHTCloseAfterConnect {
+		if err := clientDHT.Close(); err != nil {
+			p2p.Close(nil, h)
+			return fmt.Errorf("close client DHT after connect: %w", err)
+		}
+		clientDHT = nil
+		log.Println("Client DHT closed after discovery and connection")
+	}
+	if opts.P2P.Diagnostic {
+		go p2p.StartDiagnostics(ctx, h, clientDHT, decodedToken.ID, opts.Bandwidth)
 	}
 
 	// Shut the client down if the host goes away entirely.
 	watcher := newRemoteDisconnectWatcher(decodedToken.ID, requestShutdown)
 	h.Network().Notify(watcher)
 
-	opener := streamOpener{h: h, target: decodedToken.ID}
+	opener := streamOpener{h: h, target: decodedToken.ID, config: opts.P2P}
 	forwarder, err := t.Listen(ctx, opener, localPort)
 	if err != nil {
 		h.Network().StopNotify(watcher)
@@ -104,9 +116,10 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 type streamOpener struct {
 	h      host.Host
 	target peer.ID
+	config p2p.Config
 }
 
 // OpenStream opens a new tunnel stream to the target host.
 func (o streamOpener) OpenStream(ctx context.Context) (transport.Stream, error) {
-	return p2p.OpenStream(ctx, o.h, o.target)
+	return p2p.OpenStream(ctx, o.h, o.target, o.config)
 }

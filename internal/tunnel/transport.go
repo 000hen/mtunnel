@@ -10,10 +10,10 @@ import (
 
 // transportFor returns the transport for a network type. It is the single source
 // of truth for which networks the tunnel supports.
-func transportFor(network string) (transport.Transport, error) {
+func transportFor(network string, diagnostic bool) (transport.Transport, error) {
 	switch network {
 	case "tcp":
-		return tcp.New(), nil
+		return tcp.New(diagnostic), nil
 	case "udp":
 		return udp.New(), nil
 	default:
@@ -25,6 +25,6 @@ func transportFor(network string) (transport.Transport, error) {
 // returning a descriptive error if not. It lets the entry point validate the flag
 // before doing any setup work.
 func NetworkSupported(network string) error {
-	_, err := transportFor(network)
+	_, err := transportFor(network, false)
 	return err
 }
