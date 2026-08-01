@@ -26,19 +26,51 @@ itself caused the latency change.
 These are hypotheses, not a claim that a 20–30 minute Minecraft run has already
 validated the fix.
 
+### What the tier cascade changes about them
+
+The pluggable data plane (see the README's "Tunnel tiers") was not built for this
+investigation, but it bears on it directly, because on the WireGuard and QUIC
+tiers the forwarded traffic **does not ride a libp2p stream at all** — it rides a
+socket punched independently by `pion/ice`.
+
+- Hypothesis 1 stops being reachable on an upper tier: there is no application
+  stream bound to a relayed connection, so there is nothing that could fail to
+  migrate. libp2p may still be relayed for signalling without affecting the data
+  path.
+- Hypothesis 4 changes shape: the tier, not `-transport`, now determines what
+  carries the bytes, and the two are independent axes.
+- Hypothesis 2 is untouched — the client DHT lifecycle is the same either way.
+- Hypothesis 5 is untouched and still worth watching; `tunnel_copy_progress` and
+  `tunnel_blocked_write` live in `internal/tcp` and fire identically on every
+  tier.
+
+This makes the tier rows a genuine discriminator rather than another variant: if
+instability persists at the same onset time on WireGuard, hypotheses 1 and 4 are
+effectively ruled out and the cause lies outside libp2p's data path entirely. If
+it disappears, that is the strongest available evidence for them.
+
 ## Implemented instrumentation
 
 With `-diagnostic`, stderr contains JSON records suitable for JSONL ingestion:
 
 - `test_configuration`: commit SHA, role, network, connection mode, transport,
-  DHT mode, direct timeout, and UTC start time.
+  DHT mode, tunnel mode, direct/punch/handshake timeouts, configured relay and
+  STUN counts, and UTC start time.
 - `tunnel_stream_path`: remote peer, connection ID, limited/direct state,
   transport, stream multiplexer, security protocol, local/remote multiaddresses,
   `/p2p-circuit` presence, process uptime, and connection age. It is emitted for
-  every opened and accepted tunnel stream.
+  every opened and accepted tunnel stream, and once per session for the negotiate
+  stream (`event: negotiate-opened`).
+- `tunnel_tier_negotiated` once per session: both sides' advertised tiers, the
+  forced override if any, and the resolved tier.
+- `tunnel_tier_attempt` once per rung: tier, outcome, duration, and the cause of a
+  failure.
+- `tunnel_nat_punch`: outcome, duration, local/remote candidate types, and the
+  selected pair.
 - `tunnel_diagnostics` every 10 seconds: peers, connections, streams, DHT table
   size, goroutines, heap use, GC cycles, cumulative/rate bytes, active tunnel
-  transport/limited state, and direct/relay connection counts to the target.
+  tier, active tunnel transport/limited state, and direct/relay connection counts
+  to the target.
 - `tunnel_copy_progress` every 10 seconds per TCP direction: bytes and time since
   the last successful read/write.
 - `tunnel_blocked_write` when a completed write took at least 250 ms. This is a
@@ -79,20 +111,28 @@ go build -o tunnel.exe ./cmd/tunnel
 git rev-parse HEAD
 ```
 
-For each row below, start the host and client with the same `-transport` and
-`-connection-mode`, capture stderr separately, and keep the Minecraft TCP
-connection alive for at least 30 minutes:
+For each row below, start the host and client with the same `-transport`,
+`-connection-mode`, and `-tunnel-mode`, capture stderr separately, and keep the
+Minecraft TCP connection alive for at least 30 minutes:
 
 ```powershell
 # Host example
 ./tunnel.exe -port 25565 -network tcp -diagnostic `
-  -connection-mode direct-first -transport quic 2> host-quic.jsonl
+  -connection-mode direct-first -transport quic -tunnel-mode libp2p 2> host-quic.jsonl
 
 # Client example
 ./tunnel.exe -token <TOKEN> -port 25565 -diagnostic `
-  -connection-mode direct-first -transport quic `
+  -connection-mode direct-first -transport quic -tunnel-mode libp2p `
   -dht-mode close-after-connect 2> client-quic.jsonl
 ```
+
+**Pass `-tunnel-mode` explicitly on every run, including the `-transport` rows.**
+The default is now `auto`, which may put the data on WireGuard or QUIC and leave
+`-transport` describing only the signalling connection — which would silently
+confound rows 2–8, since those were designed to compare libp2p data paths. Rows
+2–8 therefore need `-tunnel-mode libp2p`. On a forced upper tier, hard-fail rather
+than fallback is the point: a `wireguard` or `quic` run that cannot establish its
+tier should abort, not quietly produce a libp2p row under a WireGuard label.
 
 Change exactly one flag between runs. Record ping/latency percentiles and mark
 the UTC time of joining, chunk loading, teleporting, entity-heavy activity, and
@@ -102,13 +142,37 @@ against the server without MTunnel and record server TPS/GC pauses.
 Recommended order:
 
 1. Direct Minecraft baseline without MTunnel.
-2. MTunnel `default + direct-first + current` (old DHT control).
+2. MTunnel `libp2p + default + direct-first + current` (old DHT control).
 3. Change only DHT mode to `close-after-connect`.
 4. Change only DHT mode to `no-refresh`.
 5. Restore `close-after-connect`; run `quic`, then `tcp`, then `webrtc`.
 6. Run `relay-only + default` as the explicit relay control.
 7. If relay is unacceptable, confirm `direct-only` fails clearly rather than
    opening a latent game session.
+8. `-tunnel-mode wireguard`, holding transport/connection/DHT flags at the row-3
+   values so the tier is the only difference from that row.
+9. `-tunnel-mode quic`, same holding.
+10. `-tunnel-mode auto`, to confirm the shipped default lands on the tier the
+    forced runs showed to be best, and to time how long the cascade takes to get
+    there.
+
+### Confirming which tier actually carried the traffic
+
+Do not take the flag's word for it. Per session the log should show:
+
+- `tunnel_tier_negotiated` with the expected `resolved` tier, on both sides.
+- `tunnel_nat_punch` with `outcome: success` for any upper-tier row, plus the
+  candidate types — a relayed or srflx-only pair is worth noting, since it
+  predicts a worse path than a host-candidate pair.
+- `tunnel_tier_attempt` per rung. On an `auto` run this is where the cascade's
+  real cost shows up: sum the durations of the failed rungs.
+- `active_tunnel_tier` in every `tunnel_diagnostics` record, which is the check
+  that matters most — it is the only one that would catch a tier changing, or
+  never having been what the negotiation claimed, mid-session.
+- On an upper tier, **no** `tunnel_stream_path` records with `event: opened` or
+  `accepted`. Only `negotiate-opened` should appear. Their absence is the direct
+  confirmation that the forwarded data left libp2p's stream path; if per-connection
+  records keep appearing, the run is a libp2p row regardless of what was negotiated.
 
 ## Results table
 
@@ -116,16 +180,29 @@ No credible 20–30 minute network result can be produced inside a unit-test
 environment. Fill this table from the JSONL and Minecraft/server observations;
 do not mark a variant fixed after a short run.
 
-| Variant | Duration | Path/transport observed | DHT peak | Peer/conn peak | Bytes in/out | Latency p50/p95/p99 | Instability start | Minecraft activity | Result |
-|---|---:|---|---:|---:|---:|---|---|---|---|
-| Direct, no tunnel | pending | direct TCP | n/a | n/a | pending | pending | pending | pending | pending |
-| default + direct-first + current | pending | diagnostic log | pending | pending | pending | pending | pending | pending | pending |
-| default + direct-first + close-after-connect | pending | diagnostic log | 0 after connect | pending | pending | pending | pending | pending | pending |
-| default + direct-first + no-refresh | pending | diagnostic log | pending | pending | pending | pending | pending | pending | pending |
-| quic + direct-first | pending | QUIC/direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
-| tcp + direct-first | pending | TCP/Yamux/direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
-| webrtc + direct-first | pending | WebRTC Direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
-| default + relay-only | pending | circuit relay expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+Every row below except the direct baseline names the tier it must be run on. The
+first eight are libp2p-tier rows — they compare libp2p data paths, and are only
+comparable to each other if the data actually stayed on libp2p.
+
+| Variant | Tier | Duration | Path/transport observed | DHT peak | Peer/conn peak | Bytes in/out | Latency p50/p95/p99 | Instability start | Minecraft activity | Result |
+|---|---|---:|---|---:|---:|---:|---|---|---|---|
+| Direct, no tunnel | n/a | pending | direct TCP | n/a | n/a | pending | pending | pending | pending | pending |
+| default + direct-first + current | libp2p | pending | diagnostic log | pending | pending | pending | pending | pending | pending | pending |
+| default + direct-first + close-after-connect | libp2p | pending | diagnostic log | 0 after connect | pending | pending | pending | pending | pending | pending |
+| default + direct-first + no-refresh | libp2p | pending | diagnostic log | pending | pending | pending | pending | pending | pending | pending |
+| quic + direct-first | libp2p | pending | QUIC/direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| tcp + direct-first | libp2p | pending | TCP/Yamux/direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| webrtc + direct-first | libp2p | pending | WebRTC Direct expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| default + relay-only | libp2p | pending | circuit relay expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| default + direct-first + close-after-connect | wireguard | pending | punched UDP, no per-conn stream_path expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| default + direct-first + close-after-connect | quic | pending | punched UDP, no per-conn stream_path expected | 0 after connect | pending | pending | pending | pending | pending | pending |
+| default + direct-first + close-after-connect | auto | pending | resolved tier + cascade duration | 0 after connect | pending | pending | pending | pending | pending | pending |
+
+For the three tier rows, also record from `tunnel_nat_punch` whether the punch
+succeeded and on what candidate types, and from `tunnel_tier_attempt` how long
+the cascade spent on rungs that failed. A `wireguard` or `quic` row where the
+punch failed is not a data point about that tier — it is a data point about the
+network, and should be recorded as such rather than left blank.
 
 ## Production recommendation and remaining uncertainty
 
@@ -143,3 +220,18 @@ WebRTC by assertion would not be evidence-based. The diagnostics distinguish
 tunnel queueing from server TPS/GC behavior and reveal whether the instability
 coincides with DHT refresh, connection churn, relay use, transport choice, or a
 stalled copy direction.
+
+The tunnel-mode recommendation is `auto`, the shipped default — but note what
+that is and is not claiming. It is a design argument: an upper tier removes
+libp2p's stream multiplexer and, when the punch succeeds, the relay from the data
+path entirely, which is a strictly shorter path than the libp2p tier can offer.
+It is **not** a measurement. The tier rows above are exactly as unfilled as the
+rest of the table, so nothing here should be read as evidence that the cascade
+resolved the reported instability.
+
+Two things would change the recommendation, and are worth watching for in the
+first long run: a punch that fails on the affected network makes `auto` strictly
+worse than `libp2p` by the cost of the failed attempts, and instability that
+persists identically on WireGuard would locate the cause outside libp2p's data
+path — the case where this whole line of investigation has been looking in the
+wrong place.

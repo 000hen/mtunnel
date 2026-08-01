@@ -10,10 +10,14 @@ import (
 )
 
 // Token carries everything a client needs to locate and dial a host: the host's
-// peer ID and the network type of the forwarded service.
+// peer ID, the network type of the forwarded service, and the host's static
+// WireGuard (X25519) public key used by the WireGuard tunnel tier. gob encodes
+// fields by name, so a token produced before WireGuardPubKey existed decodes with an
+// all-zero key rather than failing.
 type Token struct {
-	Network string
-	ID      peer.ID
+	Network         string
+	ID              peer.ID
+	WireGuardPubKey [32]byte
 }
 
 // Encode serialises the token into a base64 string suitable for sharing with

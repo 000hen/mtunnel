@@ -2,10 +2,13 @@
 
 A lightweight reverse tunnelling binary built on top of [go-libp2p](https://github.com/libp2p/go-libp2p). One side (the *host*) exposes a local TCP or UDP service, while a remote *client* dials it through libp2p relays and hole punching, eliminating the need for public inbound connectivity.
 
+libp2p handles discovery and signalling; the traffic itself rides whichever data plane the two peers can actually establish. By default they try WireGuard, then QUIC, then fall back to libp2p's own streams — see [Tunnel tiers](#tunnel-tiers).
+
 ## Features
 
 - Peer discovery through the libp2p Kademlia DHT bootstrap network
 - Automatic relays, hole punching, and NAT traversal helpers enabled out of the box
+- A pluggable data plane that negotiates the best tunnel protocol both peers support, and degrades automatically when one can't be established
 - Encoded connection tokens for bootstrapping clients without exposing raw peer IDs
 - Optional JSON control channel for listing and disconnecting active sessions
 - Single static binary that works for both host and client roles
@@ -50,7 +53,64 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 - `-network` must match the host's setting.
 - Once connected, any TCP or UDP client hitting the local port will tunnel traffic to the host's service.
 
+### Tunnel tiers
+
+Discovery, authentication, and signalling always go over libp2p. What carries the
+forwarded bytes is negotiated separately, once per peer session:
+
+| Tier | Data plane | Needs |
+| --- | --- | --- |
+| `wireguard` | WireGuard (Noise-IK) over a directly punched UDP socket, terminating in an in-process netstack | A successful NAT punch |
+| `quic` | QUIC over that same punched socket — streams for `-network tcp`, DATAGRAM frames for `-network udp` | A successful NAT punch |
+| `libp2p` | Today's behaviour: one libp2p stream per forwarded connection, over a direct or relayed connection | Nothing extra; always available |
+
+The punch is a `pion/ice` exchange against public STUN servers, signalled over a
+dedicated libp2p stream. It is independent of libp2p's own DCUtR hole punching
+and does not wait on it, so a session still relayed at the libp2p layer can carry
+its traffic over a direct WireGuard or QUIC path.
+
+`-tunnel-mode` (default `auto`) selects the policy:
+
+- `auto` — try each tier in order and use the first that comes up. One punch
+  serves both upper tiers: if the WireGuard handshake fails, QUIC is tried on the
+  very same socket rather than punching again. If the punch itself fails, both
+  upper tiers are skipped.
+- `wireguard` / `quic` — force that tier and fail the session if it cannot be
+  established, instead of silently degrading. For isolating a tier during testing.
+- `libp2p` — skip the punch entirely and use libp2p streams, as before this
+  feature existed.
+
+Both peers advertise what they support and independently intersect the two lists,
+so a forced mode on either side is enough to pin the result, and two incompatible
+forced modes converge on `libp2p` (logged explicitly rather than silently).
+
+Tier selection costs nothing when it resolves to `libp2p` up front — ICE gathering
+only starts once both sides have agreed an upper tier is worth attempting. Worst
+case, a session that tries everything and lands on `libp2p` anyway spends roughly
+`-punch-timeout` plus two `-handshake-timeout` before forwarding its first byte.
+
+Relevant flags:
+
+- `-tunnel-mode auto|wireguard|quic|libp2p`
+- `-stun-servers stun:host:port,...` — overrides the built-in Google/Cloudflare
+  defaults; the punch is skipped if none are reachable.
+- `-punch-timeout 8s` — budget for each punch phase (candidate gathering, then
+  connectivity checks).
+- `-handshake-timeout 6s` — budget for one tier's handshake before falling back.
+
+With `-diagnostic`, each session logs a `tunnel_tier_negotiated` record (both
+sides' advertised tiers and the resolved one), a `tunnel_tier_attempt` record per
+rung (tier, outcome, duration, failure cause), and `tunnel_nat_punch` for the
+punch itself. The `CONNECTED` control event carries the winning tier in its
+`tier` field.
+
 ### Connection stability and diagnostics
+
+These flags govern the libp2p layer specifically — how the *signalling*
+connection is established, and how traffic behaves on the `libp2p` tier. They are
+independent of `-tunnel-mode`: a session on the WireGuard or QUIC tier still uses
+libp2p to find its peer and negotiate, and still falls back to these settings if
+that tier can't be established.
 
 Latency-sensitive TCP traffic defaults to `-connection-mode direct-first`: a
 new application stream waits up to `-direct-timeout` for a direct libp2p
@@ -66,11 +126,12 @@ Useful controlled-test flags:
 - `-relays <multiaddr>,<multiaddr>` selects a small dedicated server relay set;
   without it the server bounds fallback candidates to three bootstrap peers.
 - `-diagnostic` emits JSON structured logs to stderr every 10 seconds, plus one
-  path record for every opened or accepted tunnel stream.
+  path record for every opened or accepted tunnel stream, and the tier and punch
+  records described above.
 
-The recommended production baseline is `direct-first`, `default` transport,
-and `close-after-connect`. Use `direct-only` when a relayed game session is less
-useful than a clear connection failure. See
+The recommended production baseline is `auto` tunnel mode, `direct-first`,
+`default` transport, and `close-after-connect`. Use `direct-only` when a relayed
+game session is less useful than a clear connection failure. See
 [`docs/connection-stability.md`](docs/connection-stability.md) for the evidence,
 test matrix, and exact long-run procedure.
 
@@ -85,7 +146,11 @@ Each event includes the action name plus auxiliary fields such as `token`, `addr
 
 ## Development
 
-- Use `go fmt ./...` and `go test ./...` before submitting changes (no tests are defined yet, but the command ensures everything builds).
+- Use `go fmt ./...`, `go vet ./...`, and `go test ./...` before submitting changes.
+- The tier packages test without any real network: `internal/wireguard` runs two
+  real devices over an in-memory bind, and `internal/tunnel`'s cascade tests run
+  the real fallback ladder over a loopback socket pair with only the NAT punch
+  substituted. Run them with `-race`, since most of that code is concurrent.
 - Control events use stdout. Diagnostic JSON logs use stderr so test runs can
   capture them independently.
 

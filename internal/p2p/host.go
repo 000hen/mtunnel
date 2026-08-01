@@ -25,6 +25,11 @@ import (
 // ProtocolID identifies the tunnel stream protocol spoken between host and client.
 const ProtocolID = "/mtunnel/1.0.0"
 
+// NegotiateProtocolID identifies the tier-negotiation stream opened once per
+// session, before any tunnel stream, to agree which data-plane tier carries
+// forwarded traffic (see internal/negotiate).
+const NegotiateProtocolID = "/mtunnel/negotiate/1.0.0"
+
 // NewServerHost creates the public-facing role. It obtains at most one relay
 // reservation, while retaining hole punching and NAT reachability services.
 func NewServerHost(cfg Config) (host.Host, *metrics.BandwidthCounter, error) {

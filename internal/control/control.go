@@ -42,6 +42,8 @@ type Output struct {
 	Addr      string    `json:"addr,omitempty"`
 	Port      int       `json:"port,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	// Tier reports the negotiated tunnel data-plane tier on CONNECTED events.
+	Tier string `json:"tier,omitempty"`
 }
 
 // Sessions is the subset of session management the control channel drives in

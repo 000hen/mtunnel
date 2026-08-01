@@ -44,6 +44,36 @@ func TestParseTransportMode(t *testing.T) {
 	}
 }
 
+func TestParseTunnelMode(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		value   string
+		want    TunnelMode
+		wantErr bool
+	}{
+		{name: "auto", value: "auto", want: TunnelAuto},
+		{name: "libp2p case insensitive", value: "LIBP2P", want: TunnelLibp2p},
+		{name: "wireguard", value: "wireguard", want: TunnelWireGuard},
+		{name: "wireguard case insensitive", value: "WireGuard", want: TunnelWireGuard},
+		{name: "quic", value: "quic", want: TunnelQUIC},
+		{name: "quic case insensitive", value: "QUIC", want: TunnelQUIC},
+		{name: "invalid", value: "carrier-pigeon", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseTunnelMode(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseTunnelMode(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("ParseTunnelMode(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseDHTMode(t *testing.T) {
 	t.Parallel()
 	for _, value := range []string{"close-after-connect", "no-refresh", "current"} {

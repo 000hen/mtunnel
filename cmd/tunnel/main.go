@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"mtunnel-libp2p/internal/control"
+	"mtunnel-libp2p/internal/nat"
 	"mtunnel-libp2p/internal/p2p"
 	"mtunnel-libp2p/internal/tunnel"
 
@@ -29,8 +30,12 @@ func main() {
 	connectionModeFlag := flag.String("connection-mode", "direct-first", "Stream policy: direct-only, direct-first, or relay-only")
 	transportFlag := flag.String("transport", "default", "libp2p transport: default, quic, tcp, or webrtc")
 	dhtModeFlag := flag.String("dht-mode", "close-after-connect", "Client DHT lifecycle: close-after-connect, no-refresh, or current")
+	tunnelModeFlag := flag.String("tunnel-mode", "auto", "Tunnel data-plane tier: auto (cascade wireguard -> quic -> libp2p), wireguard or quic (forced, no fallback), or libp2p (floor only)")
 	directTimeout := flag.Duration("direct-timeout", 15*time.Second, "Time to wait for a direct stream before explicit relay fallback")
 	relaysFlag := flag.String("relays", "", "Comma-separated dedicated relay multiaddresses ending in /p2p/<peer-id> (host only)")
+	stunServersFlag := flag.String("stun-servers", "", "Comma-separated STUN server URLs for NAT traversal; empty uses the built-in public defaults")
+	punchTimeout := flag.Duration("punch-timeout", nat.DefaultTimeout, "Time budget for each NAT hole-punch phase: candidate gathering, then connectivity checks")
+	handshakeTimeout := flag.Duration("handshake-timeout", tunnel.DefaultHandshakeTimeout, "Time budget for a tunnel tier's own handshake once the NAT punch has succeeded, before falling back")
 
 	flag.Parse()
 
@@ -59,24 +64,36 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	tunnelMode, err := p2p.ParseTunnelMode(*tunnelModeFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if *directTimeout <= 0 {
 		log.Fatal("Direct timeout must be positive")
 	}
+	if *punchTimeout <= 0 {
+		log.Fatal("Punch timeout must be positive")
+	}
+	if *handshakeTimeout <= 0 {
+		log.Fatal("Handshake timeout must be positive")
+	}
 	if *diagnostic {
-		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+		// Debug level, not the handler default: the tunnel tiers narrate at that
+		// level on purpose, because wireguard-go logs a line per handshake and per
+		// keepalive and that volume only belongs in a diagnostic run. Leaving the
+		// handler at Info would discard exactly the packet-level detail this flag
+		// exists to produce.
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	}
 	p2pConfig := p2p.Config{
 		ConnectionMode:    connectionMode,
 		Transport:         transportMode,
 		DHTMode:           dhtMode,
+		TunnelMode:        tunnelMode,
 		DirectDialTimeout: *directTimeout,
 		Diagnostic:        *diagnostic,
 	}
-	if value := strings.TrimSpace(*relaysFlag); value != "" {
-		for _, relay := range strings.Split(value, ",") {
-			p2pConfig.RelayAddrs = append(p2pConfig.RelayAddrs, strings.TrimSpace(relay))
-		}
-	}
+	p2pConfig.RelayAddrs = splitList(*relaysFlag)
 
 	// A single, signal-aware root context drives shutdown for both roles: it is
 	// cancelled on the first interrupt/termination signal and can also be cancelled
@@ -95,6 +112,14 @@ func main() {
 		fatal(emitter, "Failed to initialize peer", err)
 	}
 
+	opts := tunnel.Options{
+		P2P:              p2pConfig,
+		Bandwidth:        bandwidth,
+		STUNServers:      splitList(*stunServersFlag),
+		PunchTimeout:     *punchTimeout,
+		HandshakeTimeout: *handshakeTimeout,
+	}
+
 	if *diagnostic {
 		slog.Info("test_configuration",
 			"commit_sha", buildRevision(),
@@ -103,12 +128,15 @@ func main() {
 			"connection_mode", connectionMode,
 			"transport", transportMode,
 			"dht_mode", dhtMode,
+			"tunnel_mode", tunnelMode,
 			"direct_timeout_ms", directTimeout.Milliseconds(),
+			"punch_timeout_ms", punchTimeout.Milliseconds(),
+			"handshake_timeout_ms", handshakeTimeout.Milliseconds(),
 			"configured_relays", len(p2pConfig.RelayAddrs),
+			"configured_stun_servers", len(opts.STUNServers),
 			"start_time", time.Now().UTC().Format(time.RFC3339Nano),
 		)
 	}
-	opts := tunnel.Options{P2P: p2pConfig, Bandwidth: bandwidth}
 	if *token == "" {
 		err = tunnel.RunHost(ctx, h, emitter, *network, *port, opts)
 	} else {
@@ -117,6 +145,20 @@ func main() {
 	if err != nil {
 		fatal(emitter, "Tunnel exited with error", err)
 	}
+}
+
+// splitList parses a comma-separated flag value into its trimmed, non-empty
+// entries. It returns nil for an empty value, which every consumer reads as "not
+// configured" and answers with its own default - so passing the flag with an empty
+// value is the same as omitting it.
+func splitList(value string) []string {
+	var out []string
+	for entry := range strings.SplitSeq(value, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 func buildRevision() string {

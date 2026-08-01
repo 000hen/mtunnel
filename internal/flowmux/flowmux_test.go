@@ -1,0 +1,553 @@
+package flowmux
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"mtunnel-libp2p/internal/transport"
+)
+
+const testTimeout = 5 * time.Second
+
+// channel is one end of an in-memory message pipe: whole messages in, whole messages
+// out, exactly like the QUIC datagram channel and the virtual UDP conn the real muxes
+// run on.
+type channel struct {
+	inbox  chan []byte
+	peer   chan []byte
+	closed chan struct{}
+
+	mu      sync.Mutex
+	sendErr error
+	sent    [][]byte
+}
+
+func newChannelPair() (*channel, *channel) {
+	a2b := make(chan []byte, 256)
+	b2a := make(chan []byte, 256)
+	closed := make(chan struct{})
+	return &channel{inbox: b2a, peer: a2b, closed: closed},
+		&channel{inbox: a2b, peer: b2a, closed: closed}
+}
+
+func (c *channel) send(msg []byte) error {
+	c.mu.Lock()
+	if c.sendErr != nil {
+		err := c.sendErr
+		c.mu.Unlock()
+		return err
+	}
+	// The Mux says Send must not retain the slice, so copying here is what makes a
+	// violation of that contract show up as a test failure rather than as luck.
+	cp := append([]byte(nil), msg...)
+	c.sent = append(c.sent, cp)
+	c.mu.Unlock()
+
+	select {
+	case c.peer <- cp:
+		return nil
+	case <-c.closed:
+		return net.ErrClosed
+	}
+}
+
+func (c *channel) recv() ([]byte, error) {
+	select {
+	case msg := <-c.inbox:
+		return msg, nil
+	case <-c.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (c *channel) failSends(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sendErr = err
+}
+
+func (c *channel) messages() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.sent...)
+}
+
+func muxPair(t *testing.T) (dialer, accepter *Mux, dialChan, acceptChan *channel) {
+	t.Helper()
+
+	dialChan, acceptChan = newChannelPair()
+	dialer = New(Config{Send: dialChan.send, Recv: dialChan.recv, Dialing: true})
+	accepter = New(Config{Send: acceptChan.send, Recv: acceptChan.recv})
+	t.Cleanup(func() {
+		close(dialChan.closed)
+		_ = dialer.Close()
+		_ = accepter.Close()
+	})
+	return dialer, accepter, dialChan, acceptChan
+}
+
+func testCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func TestMuxRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	dialer, accepter, _, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := local.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	remote, err := accepter.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := remote.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(buf[:n]); got != "hello" {
+		t.Fatalf("read %q, want %q", got, "hello")
+	}
+
+	if _, err := remote.Write([]byte("world")); err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	n, err = local.Read(buf)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if got := string(buf[:n]); got != "world" {
+		t.Fatalf("reply %q, want %q", got, "world")
+	}
+}
+
+// One message in is one message out - no splicing two together and no fragmenting one
+// across reads. Forwarded UDP depends on it: internal/udp's length prefix rides inside
+// the payload and a spliced read would frame the wrong bytes.
+func TestMuxPreservesMessageBoundaries(t *testing.T) {
+	t.Parallel()
+
+	dialer, accepter, _, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	messages := [][]byte{
+		[]byte("a"),
+		bytes.Repeat([]byte("z"), 1200),
+		[]byte("tail"),
+	}
+	for _, msg := range messages {
+		if _, err := local.Write(msg); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	remote, err := accepter.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	buf := make([]byte, 4096)
+	for i, want := range messages {
+		n, err := remote.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatalf("message %d: got %d bytes, want %d", i, n, len(want))
+		}
+	}
+}
+
+func TestMuxFlowsAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	dialer, accepter, _, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	const flows = 6
+	local := make([]transport.Stream, flows)
+	for i := range local {
+		s, err := dialer.OpenStream(ctx)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		local[i] = s
+	}
+
+	// Write on every flow before accepting any, so the receive loop has to sort a
+	// backlog rather than see them one at a time.
+	for i, s := range local {
+		if _, err := s.Write([]byte{byte(i)}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Accepted order follows arrival order, and arrival order is the write order above.
+	buf := make([]byte, 8)
+	for i := range flows {
+		remote, err := accepter.AcceptStream(ctx)
+		if err != nil {
+			t.Fatalf("accept %d: %v", i, err)
+		}
+		n, err := remote.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if n != 1 || buf[0] != byte(i) {
+			t.Fatalf("flow %d received %v, want [%d]", i, buf[:n], i)
+		}
+		// Replying proves the accepted stream is bound to the right flow ID: a reply
+		// on the wrong one would reach the wrong local stream below.
+		if _, err := remote.Write([]byte{byte(100 + i)}); err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+	}
+
+	for i, s := range local {
+		n, err := s.Read(buf)
+		if err != nil {
+			t.Fatalf("read reply %d: %v", i, err)
+		}
+		if n != 1 || buf[0] != byte(100+i) {
+			t.Fatalf("flow %d reply %v, want [%d]", i, buf[:n], 100+i)
+		}
+	}
+}
+
+// IDs are namespaced by role so both sides could open flows without colliding. Only
+// the client does today, which is exactly why this is worth asserting: nothing else
+// would notice the namespacing breaking.
+func TestMuxNamespacesFlowIDsByRole(t *testing.T) {
+	t.Parallel()
+
+	dialer, accepter, dialChan, acceptChan := muxPair(t)
+	ctx := testCtx(t)
+
+	ids := func(c *channel) []uint32 {
+		var out []uint32
+		for _, msg := range c.messages() {
+			out = append(out, binary.BigEndian.Uint32(msg[:Header]))
+		}
+		return out
+	}
+
+	for i := range 3 {
+		s, err := dialer.OpenStream(ctx)
+		if err != nil {
+			t.Fatalf("dialer open %d: %v", i, err)
+		}
+		if _, err := s.Write([]byte("x")); err != nil {
+			t.Fatalf("dialer write %d: %v", i, err)
+		}
+	}
+	for i := range 3 {
+		s, err := accepter.OpenStream(ctx)
+		if err != nil {
+			t.Fatalf("accepter open %d: %v", i, err)
+		}
+		if _, err := s.Write([]byte("x")); err != nil {
+			t.Fatalf("accepter write %d: %v", i, err)
+		}
+	}
+
+	if got, want := ids(dialChan), []uint32{0, 2, 4}; !equalIDs(got, want) {
+		t.Fatalf("dialer flow IDs %v, want %v", got, want)
+	}
+	if got, want := ids(acceptChan), []uint32{1, 3, 5}; !equalIDs(got, want) {
+		t.Fatalf("accepter flow IDs %v, want %v", got, want)
+	}
+}
+
+func equalIDs(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Closing a flow has to reach the peer. Without the FIN the far end would hold a
+// forwarded local connection open until something else eventually noticed - and for
+// UDP, nothing else would.
+func TestMuxCloseSendsFIN(t *testing.T) {
+	t.Parallel()
+
+	dialer, accepter, dialChan, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := local.Write([]byte("data")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	remote, err := accepter.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	buf := make([]byte, 64)
+	if _, err := remote.Read(buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := local.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := remote.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after peer close = %v, want io.EOF", err)
+	}
+
+	sent := dialChan.messages()
+	last := sent[len(sent)-1]
+	if len(last) != Header {
+		t.Fatalf("last message was %d bytes, want a bare %d-byte FIN", len(last), Header)
+	}
+}
+
+// A FIN for a flow nobody knows about must be ignored, not treated as the start of a
+// new one - otherwise a late FIN would resurrect the flow it was ending.
+func TestMuxStrayFINDoesNotOpenAFlow(t *testing.T) {
+	t.Parallel()
+
+	_, accepter, dialChan, _ := muxPair(t)
+
+	var fin [Header]byte
+	binary.BigEndian.PutUint32(fin[:], 4242)
+	if err := dialChan.send(fin[:]); err != nil {
+		t.Fatalf("send stray FIN: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := accepter.AcceptStream(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcceptStream after a stray FIN = %v, want the accept to keep waiting", err)
+	}
+}
+
+func TestMuxDropsUnaddressableMessages(t *testing.T) {
+	t.Parallel()
+
+	_, accepter, dialChan, _ := muxPair(t)
+
+	// Too short to carry a flow ID at all.
+	for _, msg := range [][]byte{{}, {1}, {1, 2, 3}} {
+		if err := dialChan.send(msg); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := accepter.AcceptStream(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcceptStream = %v, want the runt messages to have been dropped", err)
+	}
+
+	// The receive loop must still be running afterwards.
+	frame := make([]byte, Header+1)
+	binary.BigEndian.PutUint32(frame[:Header], 7)
+	frame[Header] = 'k'
+	if err := dialChan.send(frame); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, err := accepter.AcceptStream(testCtx(t)); err != nil {
+		t.Fatalf("accept after runt messages: %v", err)
+	}
+}
+
+// A flow nobody accepts must be discarded rather than accumulate, and the drop has to
+// be reported: a silently discarded connection is indistinguishable from one that
+// never arrived.
+func TestMuxDropsFlowsWhenNobodyAccepts(t *testing.T) {
+	t.Parallel()
+
+	dialChan, acceptChan := newChannelPair()
+	defer close(dialChan.closed)
+
+	var (
+		mu      sync.Mutex
+		dropped []uint32
+	)
+	accepter := New(Config{
+		Send: acceptChan.send,
+		Recv: acceptChan.recv,
+		OnDrop: func(id uint32, _ string) {
+			mu.Lock()
+			defer mu.Unlock()
+			dropped = append(dropped, id)
+		},
+	})
+	defer accepter.Close()
+
+	// One more flow than the backlog can hold, none of them accepted.
+	for id := range uint32(inboundBacklog + 8) {
+		frame := make([]byte, Header+1)
+		binary.BigEndian.PutUint32(frame[:Header], id*2)
+		frame[Header] = 'x'
+		if err := dialChan.send(frame); err != nil {
+			t.Fatalf("send %d: %v", id, err)
+		}
+	}
+
+	deadline := time.Now().Add(testTimeout)
+	for {
+		mu.Lock()
+		n := len(dropped)
+		mu.Unlock()
+		if n >= 8 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d flows were dropped; the backlog should have overflowed", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestMuxSendErrorSurfaces(t *testing.T) {
+	t.Parallel()
+
+	dialer, _, dialChan, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	sendErr := errors.New("datagram too large")
+	dialChan.failSends(sendErr)
+
+	// The error must reach the caller rather than be swallowed: a forwarded datagram
+	// silently dropped here looks like packet loss the peer cannot diagnose.
+	if _, err := local.Write([]byte("payload")); !errors.Is(err, sendErr) {
+		t.Fatalf("write = %v, want it to wrap %v", err, sendErr)
+	}
+}
+
+func TestMuxCloseEndsLiveFlows(t *testing.T) {
+	t.Parallel()
+
+	dialer, _, _, _ := muxPair(t)
+	ctx := testCtx(t)
+
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	blocked := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, err := local.Read(buf)
+		blocked <- err
+	}()
+
+	// Let the read actually park before closing under it.
+	time.Sleep(20 * time.Millisecond)
+	if err := dialer.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("blocked read = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Close left a reader blocked")
+	}
+
+	if _, err := dialer.OpenStream(ctx); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("OpenStream after Close = %v, want net.ErrClosed", err)
+	}
+}
+
+// When the channel underneath dies, everything riding on it has to learn - both live
+// flows and anyone parked on an accept.
+func TestMuxChannelFailureUnblocksEveryone(t *testing.T) {
+	t.Parallel()
+
+	dialChan, acceptChan := newChannelPair()
+	dialer := New(Config{Send: dialChan.send, Recv: dialChan.recv, Dialing: true})
+	accepter := New(Config{Send: acceptChan.send, Recv: acceptChan.recv})
+	defer dialer.Close()
+	defer accepter.Close()
+
+	ctx := testCtx(t)
+	local, err := dialer.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	reads := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, err := local.Read(buf)
+		reads <- err
+	}()
+	accepts := make(chan error, 1)
+	go func() {
+		_, err := accepter.AcceptStream(context.Background())
+		accepts <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(dialChan.closed) // both ends share the channel's closed signal
+
+	for name, ch := range map[string]chan error{"read": reads, "accept": accepts} {
+		select {
+		case err := <-ch:
+			if err == nil {
+				t.Fatalf("%s returned success after the channel died", name)
+			}
+		case <-time.After(testTimeout):
+			t.Fatalf("%s never returned after the channel died", name)
+		}
+	}
+
+	select {
+	case <-dialer.Done():
+	case <-time.After(testTimeout):
+		t.Fatal("Done never closed after the channel died")
+	}
+}
+
+func TestMuxCloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	dialer, _, _, _ := muxPair(t)
+	for i := range 3 {
+		if err := dialer.Close(); err != nil {
+			t.Fatalf("close %d: %v", i, err)
+		}
+	}
+}

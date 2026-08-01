@@ -66,12 +66,36 @@ func ParseDHTMode(value string) (DHTMode, error) {
 	}
 }
 
+// TunnelMode selects which data-plane tier carries forwarded traffic. "auto"
+// negotiates the best tier both sides support and falls back through the cascade
+// when one does not come up; the named modes force a single tier and fail rather
+// than fall back, which is what makes them useful for isolating a tier under test.
+type TunnelMode string
+
+const (
+	TunnelAuto      TunnelMode = "auto"
+	TunnelWireGuard TunnelMode = "wireguard"
+	TunnelQUIC      TunnelMode = "quic"
+	TunnelLibp2p    TunnelMode = "libp2p"
+)
+
+func ParseTunnelMode(value string) (TunnelMode, error) {
+	mode := TunnelMode(strings.ToLower(value))
+	switch mode {
+	case TunnelAuto, TunnelWireGuard, TunnelQUIC, TunnelLibp2p:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported tunnel mode %q (want auto, wireguard, quic, or libp2p)", value)
+	}
+}
+
 // Config contains the libp2p settings shared by host creation, stream policy,
 // and diagnostics. Defaults are selected by the CLI.
 type Config struct {
 	ConnectionMode    ConnectionMode
 	Transport         TransportMode
 	DHTMode           DHTMode
+	TunnelMode        TunnelMode
 	DirectDialTimeout time.Duration
 	Diagnostic        bool
 	RelayAddrs        []string
