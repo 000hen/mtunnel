@@ -177,6 +177,131 @@ func TestSharedCascade(t *testing.T) {
 	}
 }
 
+func TestEffectivePunchAttempts(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		local uint8
+		peer  uint8
+		want  uint8
+	}{
+		{
+			// The case that keeps a mixed-version pairing working. gob decodes an absent
+			// field as zero, so a peer built before PunchAttempts existed advertises 0 -
+			// and 0 has to mean the one attempt that peer will actually make, not "no
+			// attempts" and not "as many as I like".
+			name:  "an absent peer field pins both sides to one attempt",
+			local: 4,
+			peer:  0,
+			want:  1,
+		},
+		{
+			name:  "an absent local field does the same",
+			local: 0,
+			peer:  4,
+			want:  1,
+		},
+		{
+			name:  "both absent is one attempt",
+			local: 0,
+			peer:  0,
+			want:  1,
+		},
+		{
+			name:  "agreement is taken at face value",
+			local: 2,
+			peer:  2,
+			want:  2,
+		},
+		{
+			// The lower number wins because a side that stopped punching would leave the
+			// other waiting on an outcome swap it is never going to send.
+			name:  "the more cautious side sets the limit",
+			local: 5,
+			peer:  2,
+			want:  2,
+		},
+		{
+			name:  "one is a legitimate request, not an absent field",
+			local: 1,
+			peer:  9,
+			want:  1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := EffectivePunchAttempts(tt.local, tt.peer)
+			if got != tt.want {
+				t.Errorf("EffectivePunchAttempts(%d, %d) = %d, want %d", tt.local, tt.peer, got, tt.want)
+			}
+			// Both sides compute this from the same pair of Hellos and never compare
+			// answers, so an asymmetric result would desynchronise the retry loop
+			// silently - the failure it exists to prevent.
+			if mirrored := EffectivePunchAttempts(tt.peer, tt.local); mirrored != got {
+				t.Errorf("EffectivePunchAttempts is not symmetric: %d from the other side, want %d", mirrored, got)
+			}
+		})
+	}
+}
+
+func TestExchangePunchOutcome(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		client     bool
+		host       bool
+		wantAgreed bool
+	}{
+		{name: "both landed", client: true, host: true, wantAgreed: true},
+		{name: "neither landed", client: false, host: false, wantAgreed: false},
+		{
+			// The asymmetric cases are the reason this phase exists. One side's ICE can
+			// finish while the other's context expires, and if the winner carried on
+			// alone the two would be reading different message types off one stream.
+			name: "client landed, host did not", client: true, host: false, wantAgreed: false,
+		},
+		{name: "host landed, client did not", client: false, host: true, wantAgreed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientConn, hostConn := connPair(t)
+			client := NewExchange(clientConn)
+			host := NewExchange(hostConn)
+			ctx := context.Background()
+
+			type outcome struct {
+				agreed bool
+				err    error
+			}
+			hostDone := make(chan outcome, 1)
+			go func() {
+				agreed, err := host.ExchangePunchOutcome(ctx, tt.host)
+				hostDone <- outcome{agreed, err}
+			}()
+
+			clientAgreed, err := client.ExchangePunchOutcome(ctx, tt.client)
+			if err != nil {
+				t.Fatalf("client ExchangePunchOutcome: %v", err)
+			}
+			got := <-hostDone
+			if got.err != nil {
+				t.Fatalf("host ExchangePunchOutcome: %v", got.err)
+			}
+
+			if clientAgreed != tt.wantAgreed {
+				t.Errorf("client agreed = %v, want %v", clientAgreed, tt.wantAgreed)
+			}
+			// Both sides must reach the same verdict or the lockstep is a fiction.
+			if got.agreed != clientAgreed {
+				t.Errorf("host agreed = %v, client agreed = %v - the two sides disagree", got.agreed, clientAgreed)
+			}
+		})
+	}
+}
+
 // The Attempt exchange is one-way, so it needs its own coverage: the symmetric swap
 // tests would not catch a send and a receive that disagree about the message.
 func TestExchangeAttempt(t *testing.T) {

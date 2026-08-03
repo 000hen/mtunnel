@@ -299,6 +299,10 @@ func TestBindCloseRestoresReadDeadline(t *testing.T) {
 // TestBindCloseFallsBackToClosingSubstrate covers the one case where Bind gives up
 // its hands-off stance: a substrate whose deadlines do not work leaves no other way
 // to release the receive, and a leaked conn beats a shutdown that never returns.
+//
+// It must also say so. The substrate is shared with rungs this package knows nothing
+// about, and silence here is what let the failure present as "the next tier did not work
+// either" instead of "there was no longer anything for it to work on".
 func TestBindCloseFallsBackToClosingSubstrate(t *testing.T) {
 	t.Parallel()
 	substrate := newFakeConn()
@@ -306,11 +310,14 @@ func TestBindCloseFallsBackToClosingSubstrate(t *testing.T) {
 	b := NewBind(substrate)
 	openBind(t, b)
 
-	if err := b.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := b.Close(); !errors.Is(err, ErrSubstrateAbandoned) {
+		t.Fatalf("Close = %v, want %v", err, ErrSubstrateAbandoned)
 	}
 	if n := substrate.closeCount(); n != 1 {
 		t.Errorf("substrate closed %d times, want 1", n)
+	}
+	if !b.Abandoned() {
+		t.Error("Abandoned = false after Close closed the substrate; Tunnel.Close has no other way to find out")
 	}
 }
 
@@ -335,10 +342,13 @@ func TestBindCloseSurvivesStubbedDeadlines(t *testing.T) {
 	go func() { done <- b.Close() }()
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
+		if !errors.Is(err, ErrSubstrateAbandoned) {
+			t.Fatalf("Close = %v, want %v", err, ErrSubstrateAbandoned)
 		}
-	case <-time.After(5 * time.Second):
+	// Comfortably above closeGrace, which is what this case is waiting out. The
+	// distinction the bound draws is between a Close that gave up on schedule and one
+	// that never returns at all.
+	case <-time.After(closeGrace + 5*time.Second):
 		t.Fatal("Close never returned; device.Close would hang here")
 	}
 

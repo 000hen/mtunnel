@@ -49,6 +49,49 @@ type Hello struct {
 	// decodes the absent field as false, so the newer side skips the extra phase the
 	// older side would never reach.
 	PunchProbe bool
+
+	// PunchAttempts is how many times this side is willing to punch before giving up
+	// and taking the libp2p floor. ICE against a real NAT is probabilistic - a mapping
+	// that was not there on the first pass is often there on the second - so a single
+	// attempt discards recovery that costs nothing but a few seconds.
+	//
+	// The effective count is PunchAttempts(min) of the two sides, via EffectivePunchAttempts,
+	// for the same reason PunchProbe is an AND: the two sides walk this loop in lockstep
+	// and a side that gave up early would leave the other reading a message type its
+	// peer will never send. Zero means one attempt, which is both the natural floor and
+	// what a peer predating the field decodes to - pinning that pairing to today's
+	// behaviour.
+	PunchAttempts uint8
+}
+
+// PunchOutcome reports whether this side's punch attempt produced a usable substrate.
+// It is exchanged only when both sides agreed on more than one attempt.
+//
+// It exists because "retry on failure" is not a local decision here. Each side runs its
+// own ICE agent against its own NAT, and the two do not have to fail together: the
+// client's Connect can succeed microseconds before the host's context expires. Without
+// this swap the winner would carry on to send an Attempt while the loser looped back to
+// gather again, and the two would be reading different message types off the same
+// stream - a hang, not a fallback. Retrying only when both sides report OK keeps them on
+// the same rung of the same ladder.
+type PunchOutcome struct {
+	OK bool
+}
+
+// EffectivePunchAttempts resolves how many punch attempts the two sides will make. It
+// is the smaller of the two requests, with zero - the value gob produces for a peer that
+// predates the field - meaning one.
+//
+// Both sides call it with the same pair of numbers and so reach the same answer without
+// a further round trip, exactly as SharedCascade does for tiers.
+func EffectivePunchAttempts(local, peer uint8) uint8 {
+	if local == 0 {
+		local = 1
+	}
+	if peer == 0 {
+		peer = 1
+	}
+	return min(local, peer)
 }
 
 // PunchInfo is the second negotiate message, exchanged only when the selected tier
@@ -167,6 +210,17 @@ func (x *Exchange) Negotiate(ctx context.Context, local Hello) (Tier, Hello, err
 // this milestone; M2 is its first user.
 func (x *Exchange) ExchangePunchInfo(ctx context.Context, local PunchInfo) (PunchInfo, error) {
 	return swap(ctx, x, local, "punch info")
+}
+
+// ExchangePunchOutcome swaps PunchOutcome messages, in the same symmetric shape as
+// every other phase, and reports whether *both* sides landed a substrate. Retrying is
+// only safe when the answer is agreed - see PunchOutcome.
+func (x *Exchange) ExchangePunchOutcome(ctx context.Context, ok bool) (bool, error) {
+	peer, err := swap(ctx, x, PunchOutcome{OK: ok}, "punch outcome")
+	if err != nil {
+		return false, err
+	}
+	return ok && peer.OK, nil
 }
 
 // SendAttempt tells the peer which rung of the cascade is about to be tried on the

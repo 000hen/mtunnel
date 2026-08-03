@@ -175,8 +175,10 @@ func start(ctx context.Context, substrate net.Conn, cfg Config, dialing bool) (*
 		}
 	}
 	if err != nil {
-		release(ln, tr, pc)
-		return nil, fmt.Errorf("quictun: %s: %w", role, err)
+		// Joined, not discarded: a handshake that failed is one thing, and a teardown
+		// that had to close the shared substrate to unwind is another, and the caller
+		// walking the cascade acts on the second.
+		return nil, errors.Join(fmt.Errorf("quictun: %s: %w", role, err), release(ln, tr, pc))
 	}
 
 	// Datagram support is negotiated inside the handshake, so this is the first
@@ -221,12 +223,16 @@ func start(ctx context.Context, substrate net.Conn, cfg Config, dialing bool) (*
 // release tears down a partially built tier in the reverse of construction order.
 // The transport goes before the packet conn because closing it needs a working read
 // deadline on the substrate, which the packet conn is what provides.
-func release(ln *quic.Listener, tr *quic.Transport, pc *packetConn) {
+//
+// It returns only the packet conn's error, and only because that is where
+// ErrSubstrateAbandoned comes from. The listener's and transport's own close errors say
+// nothing a caller who is already unwinding could use.
+func release(ln *quic.Listener, tr *quic.Transport, pc *packetConn) error {
 	if ln != nil {
 		_ = ln.Close()
 	}
 	_ = tr.Close()
-	_ = pc.Close()
+	return pc.Close()
 }
 
 // OpenStream starts a new forwarded connection: a QUIC stream, or a datagram flow in
@@ -259,8 +265,9 @@ func (t *Tunnel) AcceptStream(ctx context.Context) (transport.Stream, error) {
 // closed it. The host side watches it to notice a departed peer.
 func (t *Tunnel) Done() <-chan struct{} { return t.conn.Context().Done() }
 
-// Close tears the tier down and hands the substrate back untouched, so a later rung
-// or the ICE agent's own shutdown can still use it. It is safe to call more than once.
+// Close tears the tier down and normally hands the substrate back untouched, so a later
+// rung or the ICE agent's own shutdown can still use it. When it could not, it returns
+// ErrSubstrateAbandoned. It is safe to call more than once.
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(func() {
 		_ = t.conn.CloseWithError(closeCode, "tunnel closed")
@@ -276,8 +283,10 @@ func (t *Tunnel) Close() error {
 		if t.ln != nil {
 			_ = t.ln.Close()
 		}
-		t.closeErr = t.tr.Close()
-		_ = t.pc.Close()
+		// The packet conn's error is kept because ErrSubstrateAbandoned comes out of it,
+		// and joined rather than preferred because a transport that failed to close is
+		// still worth reporting on a path where nothing else will.
+		t.closeErr = errors.Join(t.tr.Close(), t.pc.Close())
 	})
 	return t.closeErr
 }

@@ -27,30 +27,62 @@ func TestConfigWithDefaults(t *testing.T) {
 		in          Config
 		wantServers []string
 		wantTimeout time.Duration
+		wantGather  time.Duration
 	}{
 		{
 			name:        "zero value gets public defaults",
 			in:          Config{},
 			wantServers: DefaultSTUNServers,
 			wantTimeout: DefaultTimeout,
+			wantGather:  DefaultGatherTimeout,
 		},
 		{
 			name:        "empty non-nil server list means no STUN",
 			in:          Config{STUNServers: []string{}},
 			wantServers: []string{},
 			wantTimeout: DefaultTimeout,
+			wantGather:  DefaultGatherTimeout,
 		},
 		{
 			name:        "explicit values are preserved",
-			in:          Config{STUNServers: []string{"stun:example.test:3478"}, Timeout: time.Second},
+			in:          Config{STUNServers: []string{"stun:example.test:3478"}, Timeout: time.Second, GatherTimeout: 250 * time.Millisecond},
 			wantServers: []string{"stun:example.test:3478"},
 			wantTimeout: time.Second,
+			wantGather:  250 * time.Millisecond,
 		},
 		{
 			name:        "non-positive timeout falls back to the default",
 			in:          Config{STUNServers: []string{}, Timeout: -time.Second},
 			wantServers: []string{},
 			wantTimeout: DefaultTimeout,
+			wantGather:  DefaultGatherTimeout,
+		},
+		{
+			// The two budgets are independent in one direction only: a caller who
+			// tightens the whole punch should not end up with a gather phase allowed to
+			// outlast it.
+			name:        "a Timeout below the gather default clamps gathering too",
+			in:          Config{STUNServers: []string{}, Timeout: time.Second},
+			wantServers: []string{},
+			wantTimeout: time.Second,
+			wantGather:  time.Second,
+		},
+		{
+			// The other direction is the point of the split: raising Timeout buys more
+			// argument with the NAT, not a longer wait for STUN servers that are not
+			// going to answer.
+			name:        "raising Timeout leaves gathering at its own default",
+			in:          Config{STUNServers: []string{}, Timeout: time.Minute},
+			wantServers: []string{},
+			wantTimeout: time.Minute,
+			wantGather:  DefaultGatherTimeout,
+		},
+		{
+			name:        "an explicit gather timeout survives a longer Timeout",
+			in:          Config{STUNServers: []string{}, Timeout: time.Minute, GatherTimeout: 10 * time.Second},
+			wantServers: []string{},
+			wantTimeout: time.Minute,
+			wantGather:  10 * time.Second,
 		},
 	}
 	for _, tt := range tests {
@@ -62,6 +94,9 @@ func TestConfigWithDefaults(t *testing.T) {
 			}
 			if got.Timeout != tt.wantTimeout {
 				t.Errorf("Timeout = %v, want %v", got.Timeout, tt.wantTimeout)
+			}
+			if got.GatherTimeout != tt.wantGather {
+				t.Errorf("GatherTimeout = %v, want %v", got.GatherTimeout, tt.wantGather)
 			}
 		})
 	}

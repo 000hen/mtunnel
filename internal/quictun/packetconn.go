@@ -1,6 +1,9 @@
 package quictun
 
 import (
+	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -52,8 +55,19 @@ type packetConn struct {
 // for the same reason: a read released by an expired deadline returns within
 // microseconds, so this is orders of magnitude of slack, while not waiting at all
 // would hand the next rung a substrate with a live reader still on it - and waiting
-// forever would mean a process that never exits.
-const closeGrace = 100 * time.Millisecond
+// forever would mean a process that never exits. The generosity is deliberate, since
+// the two errors cost very different amounts: waiting too long delays a teardown, and
+// giving up too early destroys a substrate other rungs were going to need.
+const closeGrace = time.Second
+
+// ErrSubstrateAbandoned reports that Close could not release its reader and closed the
+// substrate to break it out - a substrate this package does not own.
+//
+// It mirrors wireguard.ErrSubstrateAbandoned rather than sharing it. The two packages
+// have no dependency on one another and neither is the substrate's owner; the only place
+// that needs both answers to mean the same thing is the cascade that runs them in turn,
+// which already imports both.
+var ErrSubstrateAbandoned = errors.New("quictun: substrate abandoned")
 
 var _ net.PacketConn = (*packetConn)(nil)
 
@@ -128,10 +142,12 @@ func (p *packetConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 // error - ice.Conn implements SetReadDeadline as a stub that returns nil without
 // recording anything, and that is the substrate this runs on in production - so the
 // only evidence is the reader reporting back. If it does not within closeGrace, the
-// substrate is closed instead: a reader that cannot be released has already made it
-// unusable for whatever comes next, and QUIC is the last rung above the libp2p
-// floor, which does not use the substrate at all. wireguard.Bind.Close makes the
-// same trade for the same reason.
+// substrate is closed instead, and reported as ErrSubstrateAbandoned: a reader that
+// cannot be released has already made it unusable for whatever comes next, and QUIC is
+// the last rung above the libp2p floor, which does not use the substrate at all.
+// wireguard.Bind.Close makes the same trade for the same reason - and being below
+// WireGuard in the cascade rather than above it, its version of this is the one that
+// costs a rung.
 //
 // It must not be called from the goroutine doing the reading, which would spend the
 // whole grace period waiting for itself. quic-go never does: with a caller-supplied
@@ -161,7 +177,20 @@ func (p *packetConn) detach() error {
 	case <-timer.C:
 		// Deliberately no SetReadDeadline(time.Time{}) here: the expired deadline is
 		// the only thing still trying to release the parked reader.
-		return p.substrate.Close()
+		//
+		// The warning is unconditional, unlike every other line this package emits. The
+		// rest describe a tier that is working; this one says a resource shared with the
+		// rest of the cascade is gone, which is the difference between a rung that failed
+		// and a rung that had nothing left to fail on.
+		slog.Warn("tunnel_substrate_abandoned",
+			"tier", "quic",
+			"reason", "reader did not exit within the close grace",
+			"grace_ms", closeGrace.Milliseconds(),
+		)
+		// The close error is not worth reporting: the substrate is unusable either way,
+		// and the sentinel is what a caller acts on.
+		_ = p.substrate.Close()
+		return fmt.Errorf("%w: reader did not exit within %s", ErrSubstrateAbandoned, closeGrace)
 	}
 }
 

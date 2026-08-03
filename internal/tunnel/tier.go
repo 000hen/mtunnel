@@ -140,12 +140,26 @@ func datagramTier(network string) bool {
 // It tracks the diagnostic flag because that probe exists only to produce diagnostic
 // records - a session that negotiates a tier above the floor punches for real
 // instead, and never runs the probe.
-func localHello(wgPubKey [32]byte, mode p2p.TunnelMode, punchProbe bool) negotiate.Hello {
+func localHello(wgPubKey [32]byte, mode p2p.TunnelMode, punchProbe bool, punchAttempts uint8) negotiate.Hello {
 	return negotiate.Hello{
 		SupportedTiers:  supportedTiers(mode),
 		WireGuardPubKey: wgPubKey,
 		PunchProbe:      punchProbe,
+		PunchAttempts:   punchAttempts,
 	}
+}
+
+// punchAttemptsFor resolves this side's advertised attempt count.
+//
+// It is a function rather than a default applied inline so that the number put in the
+// Hello and the number handed to negotiate.EffectivePunchAttempts come from one place.
+// If those two ever disagreed the peer would compute a different limit from the same
+// exchange, and the retry loop's whole guarantee is that both sides count alike.
+func punchAttemptsFor(opts Options) uint8 {
+	if opts.PunchAttempts == 0 {
+		return DefaultPunchAttempts
+	}
+	return opts.PunchAttempts
 }
 
 // exchangeHello runs the Hello swap under its own deadline, so a peer that opens the
@@ -179,7 +193,13 @@ func exchangeHello(ctx context.Context, x *negotiate.Exchange, local negotiate.H
 //
 // wg tracks a background punch probe when one runs. The probe only happens on the
 // floor - a session with a shared cascade punches for real, in the foreground.
-func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts Options, ids tierIdentities, tokenWGPubKey [32]byte, network string, wg *sync.WaitGroup) (tierResult, error) {
+func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts Options, ids tierIdentities, tokenWGPubKey [32]byte, network string, wg *sync.WaitGroup) (result tierResult, err error) {
+	// Named return plus defer, rather than a call on each path out: this function reaches
+	// the floor from eight places and the record is worth nothing if it misses one.
+	// Every return here carries a tier, including the error paths, which return
+	// libp2pFloor alongside the error.
+	defer func() { logTierSelected(result.tier) }()
+
 	forced := forcesTier(opts.P2P.TunnelMode)
 
 	stream, err := p2p.OpenNegotiateStream(ctx, h, target, opts.P2P)
@@ -191,7 +211,7 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 		return libp2pFloor(), nil
 	}
 
-	local := localHello(ids.wg.public, opts.P2P.TunnelMode, opts.P2P.Diagnostic)
+	local := localHello(ids.wg.public, opts.P2P.TunnelMode, opts.P2P.Diagnostic, punchAttemptsFor(opts))
 	exchange := negotiate.NewExchange(stream)
 	tier, peerHello, err := exchangeHello(ctx, exchange, local, negotiateTimeout)
 	if err != nil {
@@ -270,7 +290,8 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 // no NAT, STUN server, or libp2p host involved.
 func climbCascade(ctx context.Context, x *negotiate.Exchange, opts Options, ids tierIdentities, peerHello negotiate.Hello, target peer.ID, network string, cascade []negotiate.Tier, newAgent punchFactory) (tierResult, error) {
 	start := time.Now()
-	punched, err := punch(ctx, x, opts, true, target.String(), ids.quic.Fingerprint, newAgent)
+	attempts := negotiate.EffectivePunchAttempts(punchAttemptsFor(opts), peerHello.PunchAttempts)
+	punched, err := punch(ctx, x, opts, true, target.String(), ids.quic.Fingerprint, attempts, newAgent)
 	if err != nil {
 		logTierAttempt(opts, cascade[0], "punch-failed", time.Since(start), err)
 		return tierResult{}, err
@@ -296,9 +317,17 @@ func climbCascade(ctx context.Context, x *negotiate.Exchange, opts Options, ids 
 		if err != nil {
 			logTierAttempt(opts, tier, outcome, time.Since(rungStart), err)
 			lastErr = err
+			if outcome == outcomeSubstrateAbandoned {
+				// The rung's teardown closed the conn every remaining rung would have run
+				// on, so there is nothing below this to try. Walking on would produce a
+				// handshake failure that says nothing about the next tier and a report
+				// that names the wrong culprit - which is exactly how this failure has
+				// been presenting as "QUIC did not work either".
+				break
+			}
 			continue
 		}
-		logTierAttempt(opts, tier, "connected", time.Since(rungStart), nil)
+		logTierAttempt(opts, tier, outcomeConnected, time.Since(rungStart), nil)
 		return tierResult{
 			tier:   tier,
 			opener: rung.opener,
@@ -398,8 +427,7 @@ func dialWireGuardClient(ctx context.Context, substrate net.Conn, opts Options, 
 		// packet can arrive at it.
 		mux, err := tun.NewUDPMux(wireguard.ClientAddr, wireguard.HostAddr, true)
 		if err != nil {
-			_ = tun.Close()
-			return clientRung{}, "mux-failed", err
+			return failedRung[clientRung](tun.Close, "mux-failed", err)
 		}
 		rung.opener = mux
 		rung.close = closeAll(mux.Close, tun.Close)
@@ -411,14 +439,15 @@ func dialWireGuardClient(ctx context.Context, substrate net.Conn, opts Options, 
 	}
 
 	if err := tun.Up(); err != nil {
-		_ = rung.close()
-		return clientRung{}, "up-failed", err
+		return failedRung[clientRung](rung.close, "up-failed", err)
 	}
 	if err := tun.WaitHandshake(ctx, opts.handshakeTimeout()); err != nil {
-		_ = rung.close()
-		return clientRung{}, "handshake-failed", err
+		// The one that matters in the field: a handshake that never lands leaves the
+		// device's receive loop parked in the substrate's Read, which is precisely the
+		// state whose teardown can end up closing the substrate.
+		return failedRung[clientRung](rung.close, "handshake-failed", err)
 	}
-	return rung, "connected", nil
+	return rung, outcomeConnected, nil
 }
 
 // dialQUICClient completes a QUIC handshake on the shared substrate. Unlike
@@ -427,9 +456,12 @@ func dialWireGuardClient(ctx context.Context, substrate net.Conn, opts Options, 
 func dialQUICClient(ctx context.Context, substrate net.Conn, opts Options, id *quictun.Identity, peerFingerprint [32]byte, network string) (clientRung, string, error) {
 	tun, err := quictun.Dial(ctx, substrate, quicConfig(opts, id, peerFingerprint, network))
 	if err != nil {
-		return clientRung{}, "handshake-failed", err
+		// No failedRung here: quictun.Dial unwinds its own partial construction and folds
+		// an abandoned substrate into the error it returns, so there is nothing left to
+		// release - only a phase to name.
+		return clientRung{}, phaseOutcome("handshake-failed", err), err
 	}
-	return clientRung{opener: tun, close: tun.Close}, "connected", nil
+	return clientRung{opener: tun, close: tun.Close}, outcomeConnected, nil
 }
 
 // quicConfig is shared by both roles so the two sides cannot drift apart on datagram
@@ -487,7 +519,7 @@ func negotiateTierHost(ctx context.Context, opts Options, ids tierIdentities, de
 	defer s.Close()
 
 	remote := s.Conn().RemotePeer()
-	local := localHello(ids.wg.public, opts.P2P.TunnelMode, opts.P2P.Diagnostic)
+	local := localHello(ids.wg.public, opts.P2P.TunnelMode, opts.P2P.Diagnostic, punchAttemptsFor(opts))
 	exchange := negotiate.NewExchange(s)
 	tier, peerHello, err := exchangeHello(ctx, exchange, local, negotiateTimeout)
 	if err != nil {
@@ -531,7 +563,8 @@ func serveUpperTiers(ctx context.Context, x *negotiate.Exchange, opts Options, i
 	remote := s.Conn().RemotePeer()
 
 	start := time.Now()
-	punched, err := punch(ctx, x, opts, false, remote.String(), ids.quic.Fingerprint, newPunchAgent)
+	attempts := negotiate.EffectivePunchAttempts(punchAttemptsFor(opts), peerHello.PunchAttempts)
+	punched, err := punch(ctx, x, opts, false, remote.String(), ids.quic.Fingerprint, attempts, newPunchAgent)
 	if err != nil {
 		// The client's half of the same punch failed too, and it is already falling to
 		// the floor, which the libp2p handler is serving.
@@ -561,10 +594,19 @@ func serveUpperTiers(ctx context.Context, x *negotiate.Exchange, opts Options, i
 			// Nothing is signalled back: the client is running the same rung on the same
 			// substrate and is finding out for itself. Wait for it to name the next one.
 			logTierAttempt(opts, pending.Tier, outcome, time.Since(rungStart), standErr)
+			if outcome == outcomeSubstrateAbandoned {
+				// There is no substrate left to stand anything else up on, so waiting for
+				// the client's next request would only produce an acknowledgement this
+				// side cannot honour. Returning resets the stream, which is what tells the
+				// client to stop climbing - the same signal it gets from any other host
+				// that cannot continue.
+				return
+			}
 			pending, err = receiveRungRequest(ctx, x)
 			continue
 		}
-		logTierAttempt(opts, pending.Tier, "serving", time.Since(rungStart), nil)
+		logTierAttempt(opts, pending.Tier, outcomeServing, time.Since(rungStart), nil)
+		logTierSelected(pending.Tier)
 
 		pending, err = serveRung(ctx, x, rung, deps, s)
 	}
@@ -633,34 +675,33 @@ func standUpWireGuardHost(substrate net.Conn, opts Options, keys wireGuardKeys, 
 	if datagramTier(network) {
 		mux, err := tun.NewUDPMux(wireguard.HostAddr, wireguard.ClientAddr, false)
 		if err != nil {
-			_ = tun.Close()
-			return hostRung{}, "mux-failed", err
+			return failedRung[hostRung](tun.Close, "mux-failed", err)
 		}
 		rung.accept = mux
 		rung.close = closeAll(mux.Close, tun.Close)
 	} else {
 		ln, err := tun.ListenTCP(netip.AddrPortFrom(wireguard.HostAddr, wireguard.VirtualPort))
 		if err != nil {
-			_ = tun.Close()
-			return hostRung{}, "listen-failed", err
+			return failedRung[hostRung](tun.Close, "listen-failed", err)
 		}
 		rung.accept = listenerAcceptor{ln: ln}
 		rung.close = closeAll(ln.Close, tun.Close)
 	}
 
 	if err := tun.Up(); err != nil {
-		_ = rung.close()
-		return hostRung{}, "up-failed", err
+		return failedRung[hostRung](rung.close, "up-failed", err)
 	}
-	return rung, "serving", nil
+	return rung, outcomeServing, nil
 }
 
 func standUpQUICHost(ctx context.Context, substrate net.Conn, opts Options, id *quictun.Identity, peerFingerprint [32]byte, network string) (hostRung, string, error) {
 	tun, err := quictun.Accept(ctx, substrate, quicConfig(opts, id, peerFingerprint, network))
 	if err != nil {
-		return hostRung{}, "handshake-failed", err
+		// quictun.Accept unwinds itself, so as on the client there is only a phase to
+		// name - and an abandoned substrate to name it instead.
+		return hostRung{}, phaseOutcome("handshake-failed", err), err
 	}
-	return hostRung{tier: negotiate.TierQUIC, accept: tun, close: tun.Close}, "serving", nil
+	return hostRung{tier: negotiate.TierQUIC, accept: tun, close: tun.Close}, outcomeServing, nil
 }
 
 // listenerAcceptor adapts a virtual TCP listener to streamAcceptor. The context is
@@ -701,13 +742,15 @@ func serveRung(ctx context.Context, x *negotiate.Exchange, rung hostRung, deps h
 
 	var live streamSet
 	var serving sync.WaitGroup
+	// Read only after serving.Wait(), which is what makes the unsynchronised write safe.
+	var teardownErr error
 	serving.Go(func() {
 		<-tierCtx.Done()
 		// Closing the rung is what unblocks the accept loop. Closing the live streams is
 		// what unblocks forwards already in flight, and it is not optional: a WireGuard
 		// device that stops passing packets leaves an established virtual conn blocked
 		// in Read forever, so the handler wait below would never return.
-		_ = rung.close()
+		teardownErr = rung.close()
 		live.closeAll()
 	})
 	serving.Go(func() {
@@ -737,6 +780,13 @@ func serveRung(ctx context.Context, x *negotiate.Exchange, rung hostRung, deps h
 	}
 	stopTier()
 	serving.Wait()
+	if got.err == nil && substrateAbandoned(teardownErr) {
+		// The client is asking for the next rung and this side no longer has anything to
+		// stand it up on. Reported as an error because that is already this function's
+		// contract for "there is no next rung", and because acknowledging a tier the host
+		// cannot serve would strand the client waiting on a handshake that never comes.
+		return negotiate.Attempt{}, teardownErr
+	}
 	return got.attempt, got.err
 }
 
@@ -838,17 +888,22 @@ func (set *streamSet) closeAll() {
 }
 
 // closeAll composes teardown functions into one that runs all of them in order and
-// reports the first error. Every step runs even if an earlier one failed: these are
-// resource releases, and skipping the rest to report a failure leaks.
+// reports every error they produced. Every step runs even if an earlier one failed:
+// these are resource releases, and skipping the rest to report a failure leaks.
+//
+// Joined rather than first-wins because one of these errors is not like the others.
+// ErrSubstrateAbandoned changes what the caller does next, and it comes from the device
+// teardown, which composes *last* - so keeping only the first error would let a routine
+// grumble from a mux close hide the one answer the cascade acts on.
 func closeAll(fns ...func() error) func() error {
 	return func() error {
-		var first error
+		var errs []error
 		for _, fn := range fns {
-			if err := fn(); err != nil && first == nil {
-				first = err
+			if err := fn(); err != nil {
+				errs = append(errs, err)
 			}
 		}
-		return first
+		return errors.Join(errs...)
 	}
 }
 
@@ -898,20 +953,101 @@ type punchResult struct {
 	peerFingerprint [32]byte
 }
 
+// errNegotiateStream marks a punch failure that happened on the negotiate stream
+// rather than in ICE.
+//
+// The distinction matters to the retry loop and nowhere else: every other failure is a
+// local one both sides can recover from by trying again, but a stream failure has
+// destroyed the channel the two sides would have to agree over. Answering it with
+// another message cannot resynchronise anything, so it ends the punch immediately.
+var errNegotiateStream = errors.New("negotiate stream failed")
+
 // punch runs Rung A: gather this side's ICE candidates, swap them with the peer over
-// the negotiate stream's second phase, and run connectivity checks.
+// the negotiate stream's second phase, and run connectivity checks - retrying the whole
+// sequence, in lockstep with the peer, up to attempts times.
 //
 // Both roles call it for the same resolved cascade and both must call it: the swap is
-// a message on a shared stream, so one side skipping it strands the other.
+// a message on a shared stream, so one side skipping it strands the other. That is also
+// why the retry cannot be a local decision. The two sides run separate ICE agents
+// against separate NATs and do not have to fail together - the client's Connect can land
+// microseconds before the host's context expires - so after each attempt they swap a
+// negotiate.PunchOutcome and continue only if *both* landed a substrate. Without that,
+// the side that succeeded would go on to send an Attempt while the side that failed
+// looped back to gather, and the stream would be carrying two different message types
+// in each direction.
+//
+// attempts of 0 or 1 skips the outcome swap entirely, leaving the wire byte-identical
+// to a peer that predates the field - see negotiate.EffectivePunchAttempts, which is
+// what both sides use to arrive at the same number without another round trip.
 //
 // fingerprint is this side's QUIC certificate hash, sent whether or not the QUIC rung
 // is ever reached - the message shape stays the same on every path. On failure
 // everything is already released.
-func punch(ctx context.Context, x *negotiate.Exchange, opts Options, controlling bool, peerID string, fingerprint [32]byte, newAgent punchFactory) (punchResult, error) {
+func punch(ctx context.Context, x *negotiate.Exchange, opts Options, controlling bool, peerID string, fingerprint [32]byte, attempts uint8, newAgent punchFactory) (punchResult, error) {
+	if attempts == 0 {
+		attempts = 1
+	}
+
+	for attempt := uint8(1); ; attempt++ {
+		result, err := punchOnce(ctx, x, opts, controlling, peerID, fingerprint, newAgent)
+
+		// One agreed attempt is today's behaviour exactly, down to the bytes on the
+		// stream. Nothing below runs.
+		if attempts == 1 {
+			return result, err
+		}
+		if errors.Is(err, errNegotiateStream) {
+			return punchResult{}, err
+		}
+
+		outcomeCtx, cancel := context.WithTimeout(ctx, punchExchangeTimeout)
+		agreed, swapErr := x.ExchangePunchOutcome(outcomeCtx, err == nil)
+		cancel()
+		if swapErr != nil {
+			releasePunch(result)
+			return punchResult{}, fmt.Errorf("%w: %w", errNegotiateStream, swapErr)
+		}
+		if agreed {
+			// agreed implies this side succeeded, so result holds a live agent.
+			return result, nil
+		}
+
+		// Either side may be the one that failed. Release whatever this side has -
+		// a substrate the peer does not share is not a substrate - and let the ICE
+		// agent go, since credentials are per-attempt and nat.Agent is not reusable.
+		releasePunch(result)
+		if err == nil {
+			err = errors.New("peer's punch did not land")
+		}
+
+		if attempt >= attempts {
+			return punchResult{}, err
+		}
+		slog.Warn("tunnel_punch_retry",
+			"attempt", attempt,
+			"attempts", attempts,
+			"peer", peerID,
+			"error", err.Error(),
+		)
+	}
+}
+
+// releasePunch closes whatever a punch attempt produced. Closing the agent is what
+// releases the conn, which is only a view onto the agent's sockets.
+func releasePunch(result punchResult) {
+	if result.agent != nil {
+		_ = result.agent.Close()
+	}
+}
+
+// punchOnce is one pass of the sequence punch retries: gather, swap credentials, check
+// connectivity. On failure everything it created is already released.
+func punchOnce(ctx context.Context, x *negotiate.Exchange, opts Options, controlling bool, peerID string, fingerprint [32]byte, newAgent punchFactory) (punchResult, error) {
 	agent, err := newAgent(ctx, nat.Config{
-		STUNServers: opts.STUNServers,
-		Timeout:     opts.PunchTimeout,
-		Diagnostic:  opts.P2P.Diagnostic,
+		STUNServers:   opts.STUNServers,
+		Timeout:       opts.PunchTimeout,
+		GatherTimeout: opts.PunchGatherTimeout,
+		Diagnostic:    opts.P2P.Diagnostic,
 	})
 	// A factory that reports neither an agent nor an error is a bug, not a runtime
 	// condition; treat it as a gather failure rather than dereference it. The
@@ -939,7 +1075,9 @@ func punch(ctx context.Context, x *negotiate.Exchange, opts Options, controlling
 		if agent != nil {
 			_ = agent.Close()
 		}
-		return punchResult{}, exchangeErr
+		// Marked, not merely returned: this is the one failure here that is not worth
+		// retrying, because it is the channel the two sides would retry over that broke.
+		return punchResult{}, fmt.Errorf("%w: %w", errNegotiateStream, exchangeErr)
 	}
 	if err != nil {
 		// Already reported as gather-failed; the send above was purely for the peer.
@@ -984,8 +1122,13 @@ func punch(ctx context.Context, x *negotiate.Exchange, opts Options, controlling
 // it against.
 //
 // It never returns an error because there is nothing a caller could do with one.
+//
+// It always punches once, whatever -punch-attempts says, and both sides do the same so
+// the stream stays symmetric. Retrying would corrupt the measurement: the number worth
+// collecting is how often a single punch lands, which is what the cascade's first
+// attempt faces.
 func runPunchProbe(ctx context.Context, x *negotiate.Exchange, opts Options, controlling bool, peerID string, newAgent punchFactory) {
-	punched, err := punch(ctx, x, opts, controlling, peerID, [32]byte{}, newAgent)
+	punched, err := punch(ctx, x, opts, controlling, peerID, [32]byte{}, 1, newAgent)
 	if err != nil {
 		return
 	}
@@ -1047,14 +1190,63 @@ func logTierNegotiated(cfg p2p.Config, local, peer negotiate.Hello, tier negotia
 	)
 }
 
+// outcomeConnected and outcomeServing are the two ways a rung ends well, one per role.
+// Every other outcome names the phase that stopped it, which is what makes a failure
+// reportable without knowing the list in advance.
+const (
+	outcomeConnected = "connected"
+	outcomeServing   = "serving"
+	// outcomeSubstrateAbandoned means the rung's teardown closed the punched conn every
+	// rung shares. It outranks whatever phase failed first, because it is the only
+	// outcome the cascade acts on rather than merely records.
+	outcomeSubstrateAbandoned = "substrate-abandoned"
+)
+
+// substrateAbandoned reports whether a rung's teardown gave up on releasing the shared
+// substrate and closed it.
+//
+// Each tier package names the condition with its own sentinel rather than a shared one:
+// neither owns the substrate, they have no dependency on one another, and this is the
+// only place that needs their two answers to mean the same thing.
+func substrateAbandoned(err error) bool {
+	return errors.Is(err, wireguard.ErrSubstrateAbandoned) || errors.Is(err, quictun.ErrSubstrateAbandoned)
+}
+
+// phaseOutcome names the phase that ended a rung's attempt, unless its teardown took the
+// substrate with it - in which case that is the more consequential fact and the one the
+// caller has to act on.
+func phaseOutcome(phase string, err error) string {
+	if substrateAbandoned(err) {
+		return outcomeSubstrateAbandoned
+	}
+	return phase
+}
+
+// failedRung releases a rung that did not come up and reports why, folding an abandoned
+// substrate into both the outcome and the error.
+//
+// The rung has failed either way; what its teardown still decides is whether there is
+// anything left for the next rung to run on.
+func failedRung[T any](release func() error, phase string, cause error) (T, string, error) {
+	var zero T
+	err := release()
+	if !substrateAbandoned(err) {
+		return zero, phase, cause
+	}
+	return zero, outcomeSubstrateAbandoned, errors.Join(cause, err)
+}
+
 // logTierAttempt records one rung of the fallback ladder: which tier was tried, how
 // it ended, and how long it took to find out. The outcome names the phase that
 // stopped it, because "wireguard failed" and "the punch never landed" call for very
 // different investigations.
+//
+// A rung that failed is reported unconditionally, at Warn. Everything describing a
+// fallback used to sit behind -diagnostic, which meant the one failure users actually
+// report - "it worked, but slowly, over the relay" - was also the one failure that left
+// no trace to report. The per-rung timeline stays behind the flag; the fact that a rung
+// dropped, and which phase dropped it, does not.
 func logTierAttempt(opts Options, tier negotiate.Tier, outcome string, elapsed time.Duration, cause error) {
-	if !opts.P2P.Diagnostic {
-		return
-	}
 	attrs := []any{
 		"tier", string(tier),
 		"outcome", outcome,
@@ -1063,7 +1255,28 @@ func logTierAttempt(opts Options, tier negotiate.Tier, outcome string, elapsed t
 	if cause != nil {
 		attrs = append(attrs, "error", cause.Error())
 	}
+
+	if outcome != outcomeConnected && outcome != outcomeServing {
+		slog.Warn("tunnel_tier_fallback", attrs...)
+	}
+	if !opts.P2P.Diagnostic {
+		return
+	}
 	slog.Info("tunnel_tier_attempt", attrs...)
+}
+
+// logTierSelected names the tier a session ended up on, unconditionally and once per
+// side. It is the counterpart to tunnel_tier_fallback: the warnings say what did not
+// work, this says what did - including negotiate.TierLibp2p, which is the case worth
+// having, since a session on the floor is otherwise indistinguishable from a healthy
+// one until someone measures the latency.
+//
+// The client emits it once, from negotiateTierClient's deferred call, so every path to
+// the floor is covered rather than the ones someone remembered. The host emits it per
+// rung it begins serving, which can legitimately fire more than once: when the client
+// falls back, the host really does switch to a different tier.
+func logTierSelected(tier negotiate.Tier) {
+	slog.Info("tunnel_tier_selected", "tier", string(tier))
 }
 
 // logPunchProbe records a punch that ended before ICE connectivity checks began.
@@ -1072,9 +1285,13 @@ func logPunchProbe(opts Options, outcome string, controlling bool, peerID string
 	if !opts.P2P.Diagnostic {
 		return
 	}
+	role := "controlled"
+	if controlling {
+		role = "controlling"
+	}
 	attrs := []any{
 		"outcome", outcome,
-		"role", map[bool]string{true: "controlling", false: "controlled"}[controlling],
+		"role", role,
 		"peer", peerID,
 	}
 	if cause != nil {

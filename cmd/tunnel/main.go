@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -34,7 +35,9 @@ func main() {
 	directTimeout := flag.Duration("direct-timeout", 15*time.Second, "Time to wait for a direct stream before explicit relay fallback")
 	relaysFlag := flag.String("relays", "", "Comma-separated dedicated relay multiaddresses ending in /p2p/<peer-id> (host only)")
 	stunServersFlag := flag.String("stun-servers", "", "Comma-separated STUN server URLs for NAT traversal; empty uses the built-in public defaults")
-	punchTimeout := flag.Duration("punch-timeout", nat.DefaultTimeout, "Time budget for each NAT hole-punch phase: candidate gathering, then connectivity checks")
+	punchTimeout := flag.Duration("punch-timeout", nat.DefaultTimeout, "Time budget for the NAT hole punch's connectivity checks")
+	punchGatherTimeout := flag.Duration("punch-gather-timeout", nat.DefaultGatherTimeout, "Time budget for NAT candidate gathering (STUN); shorter than -punch-timeout because a gather that will work finishes in well under a second")
+	punchAttempts := flag.Uint("punch-attempts", uint(tunnel.DefaultPunchAttempts), "How many times to attempt the NAT hole punch before falling back to the libp2p relay; the effective count is the lower of the two peers'")
 	handshakeTimeout := flag.Duration("handshake-timeout", tunnel.DefaultHandshakeTimeout, "Time budget for a tunnel tier's own handshake once the NAT punch has succeeded, before falling back")
 
 	flag.Parse()
@@ -73,6 +76,16 @@ func main() {
 	}
 	if *punchTimeout <= 0 {
 		log.Fatal("Punch timeout must be positive")
+	}
+	if *punchGatherTimeout <= 0 {
+		log.Fatal("Punch gather timeout must be positive")
+	}
+	// Capped at the wire type's range rather than at some policy maximum: the count is
+	// advertised as a uint8 in the Hello, so anything above 255 could not be sent, and
+	// silently truncating it would give the peer a different number than the one asked
+	// for - which is the one thing the lockstep retry cannot survive.
+	if *punchAttempts < 1 || *punchAttempts > math.MaxUint8 {
+		log.Fatalf("Punch attempts must be between 1 and %d", math.MaxUint8)
 	}
 	if *handshakeTimeout <= 0 {
 		log.Fatal("Handshake timeout must be positive")
@@ -113,17 +126,23 @@ func main() {
 	}
 
 	opts := tunnel.Options{
-		P2P:              p2pConfig,
-		Bandwidth:        bandwidth,
-		STUNServers:      splitList(*stunServersFlag),
-		PunchTimeout:     *punchTimeout,
-		HandshakeTimeout: *handshakeTimeout,
+		P2P:                p2pConfig,
+		Bandwidth:          bandwidth,
+		STUNServers:        splitList(*stunServersFlag),
+		PunchTimeout:       *punchTimeout,
+		PunchGatherTimeout: *punchGatherTimeout,
+		PunchAttempts:      uint8(*punchAttempts),
+		HandshakeTimeout:   *handshakeTimeout,
 	}
 
 	if *diagnostic {
+		role := "client"
+		if *token == "" {
+			role = "host"
+		}
 		slog.Info("test_configuration",
 			"commit_sha", buildRevision(),
-			"role", map[bool]string{true: "host", false: "client"}[*token == ""],
+			"role", role,
 			"network", *network,
 			"connection_mode", connectionMode,
 			"transport", transportMode,
@@ -131,6 +150,8 @@ func main() {
 			"tunnel_mode", tunnelMode,
 			"direct_timeout_ms", directTimeout.Milliseconds(),
 			"punch_timeout_ms", punchTimeout.Milliseconds(),
+			"punch_gather_timeout_ms", punchGatherTimeout.Milliseconds(),
+			"punch_attempts", *punchAttempts,
 			"handshake_timeout_ms", handshakeTimeout.Milliseconds(),
 			"configured_relays", len(p2pConfig.RelayAddrs),
 			"configured_stun_servers", len(opts.STUNServers),

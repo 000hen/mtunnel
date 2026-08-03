@@ -180,6 +180,63 @@ func TestDeadlineConnReadDeadlineExpiresWithoutClosingSubstrate(t *testing.T) {
 	}
 }
 
+// TestDeadlineConnExpiredDeadlineBeatsBufferedDatagram pins the one place this wrapper
+// could quietly disagree with the socket it is standing in for.
+//
+// A kernel socket with an expired read deadline fails every read, buffered data or not.
+// If Read simply selected over both the packet channel and the expired channel, Go would
+// choose between two ready cases at random and let roughly half the reads through - so a
+// consumer released by a past deadline would drain instead of stopping, for as long as
+// its peer kept sending.
+//
+// That is not a theoretical difference. Both upper tiers tear down by setting a deadline
+// in the past and waiting a bounded grace for their read loop to exit, and a loop that is
+// still being fed can outlast that grace - at which point the teardown falls back to
+// closing a substrate it does not own and the next rung never gets to run.
+func TestDeadlineConnExpiredDeadlineBeatsBufferedDatagram(t *testing.T) {
+	t.Parallel()
+
+	sub := newFakeSubstrate()
+	c := withDeadlines(sub)
+	defer sub.Close()
+
+	sub.send(t, "queued")
+	// send only proves the pump took the datagram, not that it handed it on. Wait for it
+	// to land, or the assertion below could pass for the wrong reason.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(c.packets) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("datagram never reached the packet queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := c.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline (past): %v", err)
+	}
+	// Once would be satisfied by a coin flip landing the right way; the point is that
+	// every read fails.
+	for i := range 20 {
+		if _, err := c.Read(make([]byte, 64)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("read %d with a datagram queued and the deadline past = %v, want os.ErrDeadlineExceeded", i, err)
+		}
+	}
+
+	// The datagram was refused, not dropped - the same as a socket, whose receive buffer
+	// a deadline does not touch.
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline (zero): %v", err)
+	}
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after clearing the deadline: %v", err)
+	}
+	if got := string(buf[:n]); got != "queued" {
+		t.Fatalf("Read = %q, want %q - the queued datagram should have survived the deadline", got, "queued")
+	}
+}
+
 func TestDeadlineConnZeroTimeClearsDeadline(t *testing.T) {
 	t.Parallel()
 

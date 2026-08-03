@@ -86,6 +86,18 @@ type deadline struct {
 	gen     uint64
 }
 
+// WithDeadlines wraps a conn the way Agent.Connect wraps a punched one.
+//
+// It is exported for exactly one reason: so a caller can test against the substrate it
+// will actually be handed. Production code never needs it - Connect does the wrapping -
+// but a test that stands a tier up on a bare *net.UDPConn is testing kernel-implemented
+// deadlines, not the wrapper the shipped binary runs on, and the two behave differently
+// in precisely the way that matters (see the type comment on deadlineConn).
+//
+// The returned conn owns a goroutine reading substrate. Close it, or close whatever owns
+// substrate, to release that.
+func WithDeadlines(substrate net.Conn) net.Conn { return withDeadlines(substrate) }
+
 // withDeadlines wraps a punched conn. The wrapper does not take ownership: closing it
 // closes substrate, which for an ice.Conn closes the whole agent, so Agent.Close
 // remains the one place that releases it.
@@ -159,6 +171,20 @@ func (c *deadlineConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	expired := c.read.expired
 	c.mu.Unlock()
+
+	// An expired deadline fails the read even when a datagram is already waiting. The
+	// select below would otherwise have two ready cases and choose between them at
+	// random, so a past deadline would let roughly half of all reads through - which a
+	// kernel socket never does, and which turns "release this read loop" into "release
+	// it eventually". That matters directly: a rung tears down by setting a deadline in
+	// the past and waiting a bounded grace for its loop to exit, and a loop that keeps
+	// being fed is a loop that can outlast the grace and cost the next rung its
+	// substrate.
+	select {
+	case <-expired:
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
 
 	select {
 	case buf := <-c.packets:

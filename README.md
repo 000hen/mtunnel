@@ -94,15 +94,41 @@ Relevant flags:
 - `-tunnel-mode auto|wireguard|quic|libp2p`
 - `-stun-servers stun:host:port,...` — overrides the built-in Google/Cloudflare
   defaults; the punch is skipped if none are reachable.
-- `-punch-timeout 8s` — budget for each punch phase (candidate gathering, then
-  connectivity checks).
+- `-punch-gather-timeout 3s` — budget for candidate gathering (STUN). Kept short
+  because a gather that is going to work finishes in well under a second; the
+  full timeout is only ever spent waiting out an unreachable STUN server (an
+  IPv4-only host probing over UDP6, for instance), and it is charged to the peer's
+  exchange budget too.
+- `-punch-timeout 8s` — budget for the punch's connectivity checks, separate from
+  gathering.
+- `-punch-attempts 2` — how many times each side punches before giving up on the
+  upper tiers; the effective count is the lower of the two peers'. ICE against a
+  real NAT is probabilistic, so a second attempt recovers a meaningful share of
+  first-attempt failures. A peer built before this flag existed is treated as
+  requesting one attempt, so mixed-version pairs still agree.
 - `-handshake-timeout 6s` — budget for one tier's handshake before falling back.
 
-With `-diagnostic`, each session logs a `tunnel_tier_negotiated` record (both
-sides' advertised tiers and the resolved one), a `tunnel_tier_attempt` record per
-rung (tier, outcome, duration, failure cause), and `tunnel_nat_punch` for the
-punch itself. The `CONNECTED` control event carries the winning tier in its
-`tier` field.
+Every session — with or without `-diagnostic` — logs a `tunnel_tier_selected`
+record naming the tier it settled on, and one `tunnel_tier_fallback` warning per
+rung that did not come up (tier, outcome, duration, cause), including a
+`punch-failed` outcome when the NAT punch itself did not land. A punch retry
+(see `-punch-attempts`) logs `tunnel_punch_retry` between attempts. This is
+enough to tell *what* failed without adding `-diagnostic`; add it when you also
+need candidate-level detail.
+
+With `-diagnostic`, each session additionally logs a `tunnel_tier_negotiated`
+record (both sides' advertised tiers and the resolved one), a
+`tunnel_tier_attempt` record per rung attempted (including successes), and
+`tunnel_nat_punch` with per-candidate detail for the punch itself. The
+`CONNECTED` control event carries the winning tier in its `tier` field.
+
+A rung's teardown normally hands the punched socket on to the next one intact.
+When it cannot release its own read loop in time, it closes that socket instead
+and logs an unconditional `tunnel_substrate_abandoned` warning — the cascade
+then goes straight to the `libp2p` floor rather than trying the next tier on a
+dead socket and reporting a misleading handshake failure against it. This is
+rare and points at something holding a rung's teardown open, not at the next
+tier.
 
 ### Connection stability and diagnostics
 

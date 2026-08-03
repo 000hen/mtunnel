@@ -35,12 +35,24 @@ var DefaultSTUNServers = []string{
 	"stun:stun.cloudflare.com:3478",
 }
 
-// DefaultTimeout bounds each punch phase separately - gathering, then connectivity
-// checks - rather than the punch as a whole. Gathering normally finishes well
-// inside a second; it is the checks against an uncooperative NAT that use the
-// budget. A caller wanting a hard ceiling on both should pass a context with a
-// deadline.
+// DefaultTimeout bounds connectivity checks - the phase that genuinely needs the
+// budget, because it is the one arguing with an uncooperative NAT. A caller wanting a
+// hard ceiling across both phases should pass a context with a deadline.
 const DefaultTimeout = 8 * time.Second
+
+// DefaultGatherTimeout bounds candidate gathering, which is a different problem with a
+// different shape and so no longer shares DefaultTimeout.
+//
+// Gathering that is going to work finishes in well under a second: it is a handful of
+// STUN round trips. Time spent past that is time spent waiting out servers that will
+// not answer - and it is charged twice, because the peer is blocked on this side's
+// PunchInfo for the whole of it. On an IPv4-only host the wait is guaranteed rather
+// than unlucky: candidates are gathered over UDP4 and UDP6 both, and every UDP6 probe
+// runs the full budget before giving up.
+//
+// Three seconds is generous for the round trips and short enough that losing them all
+// costs a fraction of the connectivity-check budget rather than a multiple of it.
+const DefaultGatherTimeout = 3 * time.Second
 
 // ErrNoRemote reports that Connect was called before the peer's Credentials were
 // supplied, which can never succeed: without remote candidates there is nothing to
@@ -73,8 +85,13 @@ type Config struct {
 	// bad CLI entry cannot disable NAT traversal outright.
 	STUNServers []string
 
-	// Timeout bounds each phase. Zero means DefaultTimeout.
+	// Timeout bounds connectivity checks. Zero means DefaultTimeout.
 	Timeout time.Duration
+
+	// GatherTimeout bounds candidate gathering. Zero means the smaller of Timeout and
+	// DefaultGatherTimeout - so lowering Timeout still tightens both phases, but raising
+	// it does not silently buy a longer wait for STUN servers that are not answering.
+	GatherTimeout time.Duration
 
 	// Diagnostic gates the tunnel_nat_* slog records, matching the flag of the same
 	// name elsewhere in the binary.
@@ -92,6 +109,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultTimeout
+	}
+	if c.GatherTimeout <= 0 {
+		c.GatherTimeout = min(c.Timeout, DefaultGatherTimeout)
 	}
 	return c
 }
@@ -137,7 +157,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		// which this project deliberately does not depend on - libp2p's circuit relay
 		// is already the fallback when a punch fails.
 		CandidateTypes:    []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive},
-		STUNGatherTimeout: &cfg.Timeout,
+		STUNGatherTimeout: &cfg.GatherTimeout,
 		IncludeLoopback:   cfg.includeLoopback,
 		LoggerFactory:     logFactory{diagnostic: cfg.Diagnostic},
 	})
@@ -182,7 +202,7 @@ func (a *Agent) gather(ctx context.Context) error {
 		return fmt.Errorf("gather ICE candidates: %w", err)
 	}
 
-	gatherCtx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
+	gatherCtx, cancel := context.WithTimeout(ctx, a.cfg.GatherTimeout)
 	defer cancel()
 
 	var partial bool
@@ -219,8 +239,12 @@ func (a *Agent) gather(ctx context.Context) error {
 	a.localTypes = types
 
 	if a.cfg.Diagnostic {
+		outcome := "complete"
+		if partial {
+			outcome = "partial"
+		}
 		slog.Info("tunnel_nat_gather",
-			"outcome", map[bool]string{true: "partial", false: "complete"}[partial],
+			"outcome", outcome,
 			"candidates", len(marshalled),
 			"candidate_types", types,
 		)
@@ -310,10 +334,10 @@ func (a *Agent) Connect(ctx context.Context, controlling bool) (net.Conn, error)
 	start := time.Now()
 	conn, err := connect(connectCtx, a.remote.Ufrag, a.remote.Pwd)
 	if err != nil {
-		a.logPunch(role, "failed", time.Since(start), err)
+		a.logPunch(role, punchFailed, time.Since(start), err)
 		return nil, fmt.Errorf("ICE connect as %s: %w", role, err)
 	}
-	a.logPunch(role, "connected", time.Since(start), nil)
+	a.logPunch(role, punchConnected, time.Since(start), nil)
 
 	wrapped := withDeadlines(conn)
 	a.mu.Lock()
@@ -342,31 +366,52 @@ func (a *Agent) Close() error {
 	return a.closeErr
 }
 
+// The two outcomes tunnel_nat_punch reports. They pick the record's level, so they are
+// constants rather than literals at the call sites: a typo would silently downgrade a
+// failure to Info, which is precisely the reporting gap this record exists to close.
+const (
+	punchConnected = "connected"
+	punchFailed    = "failed"
+)
+
 // logPunch emits the tunnel_nat_punch record. The selected pair is only available
 // on success and is read best-effort: a diagnostic record must never be the reason
 // a punch outcome changes.
+//
+// The outcome itself is unconditional - Info when the punch lands, Warn when it does
+// not - because a failed punch is the single event that decides a session runs on the
+// relay instead of a direct path, and it used to leave no trace at all without
+// -diagnostic. The candidate detail stays behind the flag: it is what you need to work
+// out *why* a punch failed, which is a different question from whether one did, and it
+// is verbose enough to bury an ordinary log.
 func (a *Agent) logPunch(role, outcome string, elapsed time.Duration, cause error) {
-	if !a.cfg.Diagnostic {
-		return
-	}
 	attrs := []any{
 		"outcome", outcome,
 		"role", role,
 		"duration_ms", elapsed.Milliseconds(),
-		"local_candidate_types", a.localTypes,
-		"remote_candidate_types", a.remoteTypes,
 	}
-	if pair, err := a.agent.GetSelectedCandidatePair(); err == nil && pair != nil {
+	if a.cfg.Diagnostic {
 		attrs = append(attrs,
-			"selected_local_type", pair.Local.Type().String(),
-			"selected_remote_type", pair.Remote.Type().String(),
-			"selected_pair", pair.String(),
+			"local_candidate_types", a.localTypes,
+			"remote_candidate_types", a.remoteTypes,
 		)
+		if pair, err := a.agent.GetSelectedCandidatePair(); err == nil && pair != nil {
+			attrs = append(attrs,
+				"selected_local_type", pair.Local.Type().String(),
+				"selected_remote_type", pair.Remote.Type().String(),
+				"selected_pair", pair.String(),
+			)
+		}
 	}
 	if cause != nil {
 		attrs = append(attrs, "error", cause.Error())
 	}
-	slog.Info("tunnel_nat_punch", attrs...)
+
+	if outcome == punchConnected {
+		slog.Info("tunnel_nat_punch", attrs...)
+		return
+	}
+	slog.Warn("tunnel_nat_punch", attrs...)
 }
 
 // warn records a non-fatal problem with a single candidate. cause may be nil, for

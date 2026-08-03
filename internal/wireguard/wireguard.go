@@ -110,6 +110,10 @@ type Config struct {
 type Tunnel struct {
 	dev  *device.Device
 	tnet *netstack.Net
+	// bind is kept only so Close can ask it whether it had to close the substrate.
+	// device.Close calls Bind.Close and drops what it returns, so this is the only
+	// route by which that answer reaches a caller.
+	bind *Bind
 
 	closeOnce sync.Once
 }
@@ -136,7 +140,7 @@ func New(substrate net.Conn, cfg Config) (*Tunnel, error) {
 		return nil, fmt.Errorf("configure WireGuard device: %w", err)
 	}
 
-	return &Tunnel{dev: dev, tnet: tnet}, nil
+	return &Tunnel{dev: dev, tnet: tnet, bind: bind}, nil
 }
 
 // Up starts the device. On the initiator that also sends the first handshake
@@ -302,10 +306,19 @@ func (m *UDPMux) Close() error {
 	return err
 }
 
-// Close shuts the device down and unblocks everything riding on it. It does not
-// close the substrate - see New.
+// Close shuts the device down and unblocks everything riding on it. It normally does
+// not close the substrate - see New - and returns ErrSubstrateAbandoned when it had to.
+//
+// The verdict is read back off the bind rather than returned by device.Close, which has
+// no error to return, and it is read on every call rather than only the first: a caller
+// that closes twice must not be told the substrate survived because someone else asked
+// first. Bind.Close has already run by the time device.Close returns, since it happens
+// inside the state transition device.Close performs before it returns.
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(t.dev.Close)
+	if t.bind.Abandoned() {
+		return ErrSubstrateAbandoned
+	}
 	return nil
 }
 

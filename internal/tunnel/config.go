@@ -49,6 +49,24 @@ const (
 	// Exported because it is the -handshake-timeout flag's default, which the CLI
 	// needs to state before it has an Options to ask.
 	DefaultHandshakeTimeout = 6 * time.Second
+
+	// DefaultPunchAttempts is how many times a session punches before settling for the
+	// libp2p relay.
+	//
+	// Two, not one, because ICE against a real NAT is probabilistic rather than
+	// deterministic: a mapping the peer's probe arrived too early for on the first pass
+	// is usually there on the second, and a first attempt that lost its STUN replies to
+	// ordinary UDP loss has nothing wrong with it that trying again does not fix. The
+	// cost of the extra attempt is bounded and only paid by sessions that were heading
+	// for the relay anyway - which is a far worse outcome than a few seconds of startup.
+	//
+	// Not more than two, because past that the failures left are structural (symmetric
+	// NAT on both sides, UDP blocked outright) and no number of attempts will fix them;
+	// they need the relay, and making them wait longer to reach it helps nobody.
+	//
+	// Exported because it is the -punch-attempts flag's default, which the CLI needs to
+	// state before it has an Options to ask.
+	DefaultPunchAttempts uint8 = 2
 )
 
 // Options carries policies selected at the CLI boundary into orchestration.
@@ -56,15 +74,25 @@ type Options struct {
 	P2P       p2p.Config
 	Bandwidth *metrics.BandwidthCounter
 
-	// STUNServers and PunchTimeout configure the independent ICE hole punch
-	// (internal/nat). They sit here rather than in P2P because the punch is
+	// STUNServers, PunchTimeout and PunchGatherTimeout configure the independent ICE
+	// hole punch (internal/nat). They sit here rather than in P2P because the punch is
 	// deliberately libp2p-free - libp2p only carries the credential exchange - and
 	// p2p.Config is documented as libp2p's own settings.
 	//
-	// A nil STUNServers means nat.DefaultSTUNServers; a zero PunchTimeout means
-	// nat.DefaultTimeout.
-	STUNServers  []string
-	PunchTimeout time.Duration
+	// PunchTimeout bounds connectivity checks and PunchGatherTimeout bounds candidate
+	// gathering; they are separate because the two phases fail on completely different
+	// timescales. A nil STUNServers means nat.DefaultSTUNServers, a zero PunchTimeout
+	// means nat.DefaultTimeout, and a zero PunchGatherTimeout means the smaller of
+	// PunchTimeout and nat.DefaultGatherTimeout.
+	STUNServers        []string
+	PunchTimeout       time.Duration
+	PunchGatherTimeout time.Duration
+
+	// PunchAttempts is how many times this side will punch before taking the libp2p
+	// floor. It is advertised in the Hello and the effective count is the smaller of the
+	// two sides' - see negotiate.EffectivePunchAttempts - because the retry has to be a
+	// joint decision, not a local one. Zero means DefaultPunchAttempts.
+	PunchAttempts uint8
 
 	// HandshakeTimeout bounds each tier's own handshake once the punch has produced
 	// a substrate. Zero means DefaultHandshakeTimeout.

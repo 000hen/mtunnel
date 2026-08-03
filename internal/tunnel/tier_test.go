@@ -69,7 +69,7 @@ func TestExchangeHelloTimesOutOnSilentPeer(t *testing.T) {
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
 
 	start := time.Now()
-	_, _, err := exchangeHello(context.Background(), negotiate.NewExchange(conn), localHello([32]byte{}, p2p.TunnelAuto, false), 50*time.Millisecond)
+	_, _, err := exchangeHello(context.Background(), negotiate.NewExchange(conn), localHello([32]byte{}, p2p.TunnelAuto, false, DefaultPunchAttempts), 50*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -99,7 +99,7 @@ func TestProbeAgreed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := probeAgreed(localHello([32]byte{}, p2p.TunnelAuto, tt.local), localHello([32]byte{}, p2p.TunnelAuto, tt.peer))
+			got := probeAgreed(localHello([32]byte{}, p2p.TunnelAuto, tt.local, DefaultPunchAttempts), localHello([32]byte{}, p2p.TunnelAuto, tt.peer, DefaultPunchAttempts))
 			if got != tt.want {
 				t.Errorf("probeAgreed(local=%v, peer=%v) = %v, want %v", tt.local, tt.peer, got, tt.want)
 			}
@@ -253,6 +253,220 @@ func runProbePair(t *testing.T, clientAgent, hostAgent punchAgent, clientErr, ho
 	}
 	if elapsed := time.Since(start); elapsed >= probeDeadline {
 		t.Fatalf("punch probe pair took %v, want well under %v", elapsed, probeDeadline)
+	}
+}
+
+// scriptedAgents is a punchFactory that issues one agent per attempt and drives each
+// one's outcome from a script.
+//
+// A factory rather than a single reusable double on purpose: nat.Agent is documented as
+// not reusable - its ICE credentials belong to one attempt - so a retry that handed the
+// old agent back would be testing something the production path cannot do. Every agent
+// it issues is recorded, which is what lets a test assert both how many attempts ran and
+// that each got its own agent.
+type scriptedAgents struct {
+	tag string
+	// fail[n] fails the (n+1)th attempt's connectivity checks. Attempts past the end of
+	// the script succeed.
+	fail []bool
+
+	mu     sync.Mutex
+	issued []*fakePunchAgent
+}
+
+func (s *scriptedAgents) factory() punchFactory {
+	return func(context.Context, nat.Config) (punchAgent, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		agent := &fakePunchAgent{local: gatheredCredentials(s.tag)}
+		if n := len(s.issued); n < len(s.fail) && s.fail[n] {
+			agent.connectErr = errors.New("checks timed out")
+		}
+		s.issued = append(s.issued, agent)
+		return agent, nil
+	}
+}
+
+func (s *scriptedAgents) made() []*fakePunchAgent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.issued)
+}
+
+// runPunchPair drives both halves of punch against each other over a real loopback
+// stream with the given agreed attempt count, and returns each side's error.
+//
+// Both sides are given the same count deliberately: production derives it from
+// negotiate.EffectivePunchAttempts, which is symmetric by construction, and a test that
+// passed different numbers would be exercising a state the wire cannot produce.
+func runPunchPair(t *testing.T, attempts uint8, client, host *scriptedAgents) (clientErr, hostErr error) {
+	t.Helper()
+	clientConn, hostConn := connPair(t)
+	opts := Options{PunchTimeout: time.Second}
+
+	type outcome struct {
+		side   string
+		result punchResult
+		err    error
+	}
+	done := make(chan outcome, 2)
+	run := func(side string, conn net.Conn, controlling bool, agents *scriptedAgents) {
+		result, err := punch(context.Background(), negotiate.NewExchange(conn), opts, controlling, "peer-"+side, [32]byte{}, attempts, agents.factory())
+		done <- outcome{side: side, result: result, err: err}
+	}
+	go run("client", clientConn, true, client)
+	go run("host", hostConn, false, host)
+
+	// The bound is per pair, not per attempt, and stays under punchExchangeTimeout for
+	// the reason probeDeadline documents: a side that returns without sending strands
+	// its peer for the full exchange timeout, and a looser bound would let that pass.
+	seen := make([]string, 0, 2)
+	for range 2 {
+		select {
+		case got := <-done:
+			seen = append(seen, got.side)
+			// Whatever the verdict, a punch that returns must not leave a substrate
+			// behind for a caller that was handed an error.
+			if got.err != nil && got.result.agent != nil {
+				t.Errorf("%s returned an error and an agent; the agent should have been released", got.side)
+			}
+			if got.result.agent != nil {
+				t.Cleanup(func() { _ = got.result.agent.Close() })
+			}
+			if got.side == "client" {
+				clientErr = got.err
+			} else {
+				hostErr = got.err
+			}
+		case <-time.After(probeDeadline):
+			t.Fatalf("punch stalled: only %v finished within %v; the two sides are out of lockstep", seen, probeDeadline)
+		}
+	}
+	return clientErr, hostErr
+}
+
+// TestPunchRetriesInLockstep is the retry's central claim: the two sides make the same
+// number of attempts and stop on the same one, whichever of them actually failed.
+//
+// The asymmetric rows are the point. Each side runs its own ICE agent against its own
+// NAT, so "did the punch work" has two answers, and a side that acted on its own answer
+// alone would go on to send an Attempt while its peer looped back to gather - two
+// message types crossing on one stream, which is a hang rather than a fallback.
+func TestPunchRetriesInLockstep(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		attempts    uint8
+		clientFails []bool
+		hostFails   []bool
+		wantErr     bool
+		wantAgents  int
+	}{
+		{
+			name:       "both land on the first attempt",
+			attempts:   2,
+			wantErr:    false,
+			wantAgents: 1,
+		},
+		{
+			// The recovery the retry exists for: a first attempt that failed for a
+			// reason a second one does not hit.
+			name:        "client fails once then lands",
+			attempts:    2,
+			clientFails: []bool{true},
+			wantErr:     false,
+			wantAgents:  2,
+		},
+		{
+			// The host is the one that failed, but the client retries too - and had to
+			// throw away a substrate that worked, because a substrate the peer does not
+			// share is not one.
+			name:       "host fails once then lands",
+			attempts:   2,
+			hostFails:  []bool{true},
+			wantErr:    false,
+			wantAgents: 2,
+		},
+		{
+			// Exhaustion is the floor, and it is bounded: exactly the agreed number of
+			// attempts, not one more.
+			name:        "both fail every attempt",
+			attempts:    2,
+			clientFails: []bool{true, true},
+			hostFails:   []bool{true, true},
+			wantErr:     true,
+			wantAgents:  2,
+		},
+		{
+			// One attempt is wire-identical to a peer predating the field: no outcome
+			// swap at all. The asymmetry is not repaired - it cannot be, with nothing
+			// exchanged - but neither side may hang on it.
+			name:        "a single agreed attempt does not retry",
+			attempts:    1,
+			clientFails: []bool{true},
+			wantErr:     false, // only the host lands; asserted per-side below
+			wantAgents:  1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := &scriptedAgents{tag: "client", fail: tt.clientFails}
+			host := &scriptedAgents{tag: "host", fail: tt.hostFails}
+			clientErr, hostErr := runPunchPair(t, tt.attempts, client, host)
+
+			clientAgents, hostAgents := client.made(), host.made()
+			if len(clientAgents) != tt.wantAgents || len(hostAgents) != tt.wantAgents {
+				t.Errorf("agents issued = client %d / host %d, want %d each", len(clientAgents), len(hostAgents), tt.wantAgents)
+			}
+
+			if tt.attempts == 1 {
+				// Without the swap each side reports only what it saw itself, which is
+				// exactly the behaviour this pairing is meant to preserve.
+				if clientErr == nil {
+					t.Error("client punch succeeded, want the failure its own agent reported")
+				}
+				if hostErr != nil {
+					t.Errorf("host punch = %v, want success", hostErr)
+				}
+				return
+			}
+
+			// With the swap in play the verdict is joint, so the two sides must agree.
+			if (clientErr != nil) != (hostErr != nil) {
+				t.Errorf("sides disagree: client = %v, host = %v", clientErr, hostErr)
+			}
+			if (clientErr != nil) != tt.wantErr {
+				t.Errorf("punch error = %v, want error: %v", clientErr, tt.wantErr)
+			}
+
+			// Every agent but the surviving one must be closed. That includes agents
+			// whose own Connect succeeded: keeping one would leak an ICE agent and, worse,
+			// tempt a caller into using a substrate the peer abandoned.
+			assertSpentAgentsClosed(t, "client", clientAgents, clientErr == nil)
+			assertSpentAgentsClosed(t, "host", hostAgents, hostErr == nil)
+		})
+	}
+}
+
+// assertSpentAgentsClosed checks that every agent from a superseded attempt was released.
+// When the punch succeeded the final agent is the live one and must NOT be closed - it
+// owns the substrate every rung above is about to run on.
+func assertSpentAgentsClosed(t *testing.T, side string, agents []*fakePunchAgent, succeeded bool) {
+	t.Helper()
+	for i, agent := range agents {
+		_, _, closed := agent.state()
+		last := i == len(agents)-1
+		if last && succeeded {
+			if closed != 0 {
+				t.Errorf("%s agent %d closed %d times, want 0 - it owns the surviving substrate", side, i, closed)
+			}
+			continue
+		}
+		if closed == 0 {
+			t.Errorf("%s agent %d was never closed; a superseded punch attempt leaks its ICE agent", side, i)
+		}
 	}
 }
 
@@ -460,8 +674,8 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 
 			// Start both sides before awaiting either: neither completes until its
 			// counterpart has sent.
-			clientOut := run(clientConn, localHello([32]byte{}, tt.clientMode, false))
-			hostOut := run(hostConn, localHello(hostKey, tt.hostMode, false))
+			clientOut := run(clientConn, localHello([32]byte{}, tt.clientMode, false, DefaultPunchAttempts))
+			hostOut := run(hostConn, localHello(hostKey, tt.hostMode, false, DefaultPunchAttempts))
 			client := <-clientOut
 			host := <-hostOut
 

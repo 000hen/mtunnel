@@ -51,11 +51,35 @@ it disappears, that is the strongest available evidence for them.
 
 ## Implemented instrumentation
 
-With `-diagnostic`, stderr contains JSON records suitable for JSONL ingestion:
+Every session, `-diagnostic` or not, logs enough to say *which phase* fell back
+without reproducing the failure:
+
+- `tunnel_tier_selected` once per session: the tier the cascade settled on,
+  including the libp2p floor.
+- `tunnel_tier_fallback` (`slog.Warn`) once per rung that did not come up: tier,
+  outcome (the phase that stopped it, or `substrate-abandoned` — see below),
+  duration, and cause. A `punch-failed` outcome means the shared substrate never
+  came up at all, so no upper tier was attempted.
+- `tunnel_punch_retry` (`slog.Warn`) between punch attempts, when
+  `-punch-attempts` allows more than one: attempt number, agreed attempt count,
+  peer, and the cause of the attempt that just failed.
+- `tunnel_substrate_abandoned` (`slog.Warn`) when a rung's teardown could not
+  release its own read loop in time and closed the punched socket to break out.
+  This is the one record that changes what happened next: the cascade treats it
+  as terminal and goes straight to the libp2p floor rather than trying the next
+  rung on a socket that is already gone. Before this existed, that sequence
+  presented as an unrelated handshake failure on whichever tier was tried next —
+  see "What it caught" in `plan/review/010-cascade-test-bypasses-deadlineconn.md`
+  for the bug this uncovered.
+- `tunnel_nat_punch` (`nat` package): outcome and duration always; candidate
+  types and the selected pair only `if -diagnostic`.
+
+With `-diagnostic`, stderr additionally contains JSON records suitable for JSONL
+ingestion:
 
 - `test_configuration`: commit SHA, role, network, connection mode, transport,
-  DHT mode, tunnel mode, direct/punch/handshake timeouts, configured relay and
-  STUN counts, and UTC start time.
+  DHT mode, tunnel mode, direct/punch-gather/punch/handshake timeouts, punch
+  attempts, configured relay and STUN counts, and UTC start time.
 - `tunnel_stream_path`: remote peer, connection ID, limited/direct state,
   transport, stream multiplexer, security protocol, local/remote multiaddresses,
   `/p2p-circuit` presence, process uptime, and connection age. It is emitted for
@@ -63,10 +87,9 @@ With `-diagnostic`, stderr contains JSON records suitable for JSONL ingestion:
   stream (`event: negotiate-opened`).
 - `tunnel_tier_negotiated` once per session: both sides' advertised tiers, the
   forced override if any, and the resolved tier.
-- `tunnel_tier_attempt` once per rung: tier, outcome, duration, and the cause of a
-  failure.
-- `tunnel_nat_punch`: outcome, duration, local/remote candidate types, and the
-  selected pair.
+- `tunnel_tier_attempt` once per rung *attempted*, including successes — a
+  superset of the always-on `tunnel_tier_fallback`/`tunnel_tier_selected` pair
+  above, useful for timing rather than triage.
 - `tunnel_diagnostics` every 10 seconds: peers, connections, streams, DHT table
   size, goroutines, heap use, GC cycles, cumulative/rate bytes, active tunnel
   tier, active tunnel transport/limited state, and direct/relay connection counts
@@ -160,12 +183,23 @@ Recommended order:
 
 Do not take the flag's word for it. Per session the log should show:
 
-- `tunnel_tier_negotiated` with the expected `resolved` tier, on both sides.
-- `tunnel_nat_punch` with `outcome: success` for any upper-tier row, plus the
-  candidate types — a relayed or srflx-only pair is worth noting, since it
-  predicts a worse path than a host-candidate pair.
-- `tunnel_tier_attempt` per rung. On an `auto` run this is where the cascade's
-  real cost shows up: sum the durations of the failed rungs.
+- `tunnel_tier_selected` naming the expected tier — this one needs no
+  `-diagnostic` and is the fastest check.
+- `tunnel_tier_negotiated` with the expected `resolved` tier, on both sides
+  (`-diagnostic` only).
+- `tunnel_nat_punch` with `outcome: success` for any upper-tier row. With
+  `-diagnostic`, it also carries the candidate types — a relayed or srflx-only
+  pair is worth noting, since it predicts a worse path than a host-candidate
+  pair.
+- No `tunnel_tier_fallback` for the tier under test, and critically no
+  `tunnel_substrate_abandoned` — the latter means an upper tier did not merely
+  fail, it took the punched socket with it, so anything below it in the cascade
+  never got a real attempt. Treat that as a run to redo, not a data point on the
+  tier that was "tried" next.
+- `tunnel_tier_attempt` per rung (`-diagnostic` only). On an `auto` run this is
+  where the cascade's real cost shows up: sum the durations of the failed rungs.
+  If `-punch-attempts` is above 1, `tunnel_punch_retry` shows how many of those
+  attempts were spent on the punch itself before a rung was ever tried.
 - `active_tunnel_tier` in every `tunnel_diagnostics` record, which is the check
   that matters most — it is the only one that would catch a tier changing, or
   never having been what the negotiation claimed, mid-session.
@@ -199,10 +233,20 @@ comparable to each other if the data actually stayed on libp2p.
 | default + direct-first + close-after-connect | auto | pending | resolved tier + cascade duration | 0 after connect | pending | pending | pending | pending | pending | pending |
 
 For the three tier rows, also record from `tunnel_nat_punch` whether the punch
-succeeded and on what candidate types, and from `tunnel_tier_attempt` how long
-the cascade spent on rungs that failed. A `wireguard` or `quic` row where the
-punch failed is not a data point about that tier — it is a data point about the
-network, and should be recorded as such rather than left blank.
+succeeded and on what candidate types, whether `tunnel_punch_retry` fired (and
+on which attempt it recovered), and from `tunnel_tier_attempt` how long the
+cascade spent on rungs that failed. A `wireguard` or `quic` row where the punch
+failed is not a data point about that tier — it is a data point about the
+network, and should be recorded as such rather than left blank. Likewise, a row
+where `tunnel_substrate_abandoned` fired is a data point about whatever kept
+that rung's teardown from releasing its read loop, not about the tier tried
+next — re-run rather than record the next tier as a failure.
+
+Two runs worth doing specifically for this: one with `-punch-attempts 1` on a
+connection that otherwise falls back, to confirm the retry is what changed the
+outcome rather than run-to-run variance; and one with `-diagnostic` on a run
+that still falls back, to get the candidate-level detail `tunnel_nat_punch`
+only emits under that flag.
 
 ## Production recommendation and remaining uncertainty
 

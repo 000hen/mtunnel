@@ -51,6 +51,13 @@ const (
 // Config is what a Mux needs from the channel it runs on.
 type Config struct {
 	// Send delivers one framed message to the peer. It must not retain the slice.
+	//
+	// That is load-bearing, not advisory: flow.send hands over a pooled buffer and
+	// reuses it as soon as Send returns, so an implementation that queued the slice
+	// for later would transmit whatever the next flow wrote into it. Both current
+	// implementations comply - wireguard's UDPMux.send is a synchronous conn.Write,
+	// and quic-go's SendDatagram copies into the frame it queues - and a new one that
+	// cannot must copy before returning.
 	Send func([]byte) error
 
 	// Recv returns the next message the peer sent. The Mux takes ownership of what it
@@ -381,19 +388,47 @@ func (f *flow) send(payload []byte) error {
 	default:
 	}
 
-	frame := make([]byte, Header+len(payload))
-	binary.BigEndian.PutUint32(frame[:Header], f.id)
-	copy(frame[Header:], payload)
+	// The frame comes from the pool rather than the heap: this is the per-datagram path
+	// of both unreliable tiers, and the header has to sit in front of a payload the
+	// caller owns, so the copy is unavoidable but the allocation is not. Taking a fresh
+	// buffer per call - rather than one scratch buffer per flow - is what keeps this
+	// safe without a lock: transport.Stream does not promise a single writer, and two
+	// concurrent Writes on one flow would otherwise interleave into the same bytes.
+	bufp := framePool.Get().(*[]byte)
+	frame := binary.BigEndian.AppendUint32((*bufp)[:0], f.id)
+	frame = append(frame, payload...)
 
 	// A message the channel cannot carry - a QUIC datagram over the path limit, say -
 	// surfaces here rather than being papered over. Splitting the payload would deliver
 	// a forwarded datagram the application never sent, and dropping it silently would
 	// look like packet loss the peer could not diagnose; failing the flow is the only
 	// option that stays honest about what happened.
-	if err := f.mux.cfg.Send(frame); err != nil {
+	err := f.mux.cfg.Send(frame)
+
+	// Returned whatever happened, and only after Send has returned: Config.Send is
+	// documented not to retain the slice, which is precisely what makes reuse legal
+	// here. A grown buffer is kept at its new capacity so a flow carrying large
+	// datagrams stops reallocating after the first few.
+	*bufp = frame[:0]
+	framePool.Put(bufp)
+
+	if err != nil {
 		return fmt.Errorf("flowmux: send on flow %d: %w", f.id, err)
 	}
 	return nil
+}
+
+// framePool holds frame buffers for send. The initial capacity covers a header plus a
+// payload at any MTU either tier can carry, so the steady state neither allocates nor
+// grows.
+//
+// It stores *[]byte rather than []byte because a slice put back into a sync.Pool as an
+// interface value allocates its own header every time, which would defeat the point.
+var framePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, Header+2048)
+		return &b
+	},
 }
 
 // close ends the flow locally and tells the peer, so its side is released now rather

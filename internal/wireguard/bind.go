@@ -3,6 +3,7 @@ package wireguard
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -10,6 +11,16 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 )
+
+// ErrSubstrateAbandoned reports that Close could not release its receive loop and closed
+// the substrate to break it out - a substrate this package explicitly does not own.
+//
+// It is worth a sentinel rather than a log line because it changes what the caller can do
+// next, not merely what it knows. The tier cascade runs every rung on one punched conn,
+// so a rung that closed it has not just failed: it has taken every rung below it with it,
+// and a caller that keeps walking would report the next tier as broken when the substrate
+// is what is gone.
+var ErrSubstrateAbandoned = errors.New("wireguard: substrate abandoned")
 
 // endpoint is the sole conn.Endpoint a Bind ever produces. A punched substrate has
 // exactly one peer by construction - it is a connected socket, not a listening one -
@@ -70,17 +81,23 @@ type Bind struct {
 	// the device, which is the only evidence Close gets that the loop has actually
 	// left the substrate's Read. It is installed and captured exactly like closed.
 	exited chan struct{}
+	// abandoned records that Close took the fallback and closed the substrate. It is
+	// kept rather than only returned because device.Close discards whatever Bind.Close
+	// reports - it has no channel for it - so Tunnel.Close reads it from here instead.
+	abandoned bool
 }
 
 // closeGrace bounds how long Close waits for that evidence before falling back to
 // closing the substrate.
 //
-// A receive released by an expired read deadline returns within microseconds, so
-// this is several orders of magnitude of slack for a loaded machine. The asymmetry
-// is deliberate: waiting it out costs a slower shutdown, while not waiting long
-// enough costs a substrate closed under a live receive - and skipping the fallback
-// entirely costs a process that never exits.
-const closeGrace = 100 * time.Millisecond
+// A receive released by an expired read deadline returns within microseconds, so even
+// a fraction of this is orders of magnitude of slack. The number is nevertheless a
+// full second, because the two sides of the trade are not the same size: waiting it
+// out costs a slower shutdown on a path that is already failing, while giving up too
+// early costs the shared substrate and therefore every rung that had not been tried
+// yet. Skipping the fallback entirely is not an option either - device.Close waits on
+// the receive goroutines, so a loop that is never released hangs the process.
+const closeGrace = time.Second
 
 var (
 	_ conn.Bind     = (*Bind)(nil)
@@ -177,7 +194,9 @@ func (b *Bind) receive(closed chan struct{}, packets [][]byte, sizes []int, eps 
 // that is precisely the substrate this bind runs on in production. Wait for the
 // receive to report back instead, and if it does not, close the substrate. That is
 // the only lever left, and a substrate closed a moment before its owner would have
-// closed it anyway beats a device.Close that never returns.
+// closed it anyway beats a device.Close that never returns. It is reported as
+// ErrSubstrateAbandoned rather than silently, because the owner may have had further
+// use for it.
 //
 // When the receive does report back, the deadline is cleared before returning. The
 // substrate is handed on to the next rung of the tier cascade, and a deadline left in
@@ -200,7 +219,7 @@ func (b *Bind) Close() error {
 	b.mu.Unlock()
 
 	if err := b.conn.SetReadDeadline(time.Now()); err != nil {
-		return b.conn.Close()
+		return b.abandon("substrate refused a read deadline", err)
 	}
 
 	// Deliberately not under the mutex: this waits, and holding it would block a
@@ -217,8 +236,42 @@ func (b *Bind) Close() error {
 		_ = b.conn.SetReadDeadline(time.Time{})
 		return nil
 	case <-timer.C:
-		return b.conn.Close()
+		// Deliberately no SetReadDeadline(time.Time{}) here: the expired deadline is the
+		// only thing still trying to release the parked receive.
+		return b.abandon("receive loop did not exit within the close grace", nil)
 	}
+}
+
+// abandon closes the substrate as the last way to release a receive that would not let
+// go, and reports it as the consequential event it is.
+//
+// The warning is unconditional. Every other line this package emits is diagnostic detail
+// about a tunnel that is working; this one says a resource shared with code outside the
+// package is gone, and it is the difference between "the QUIC tier failed too" and "there
+// was nothing left for the QUIC tier to run on".
+func (b *Bind) abandon(reason string, cause error) error {
+	b.mu.Lock()
+	b.abandoned = true
+	b.mu.Unlock()
+
+	attrs := []any{"tier", "wireguard", "reason", reason, "grace_ms", closeGrace.Milliseconds()}
+	if cause != nil {
+		attrs = append(attrs, "error", cause.Error())
+	}
+	slog.Warn("tunnel_substrate_abandoned", attrs...)
+
+	// The close error itself is not worth reporting: the substrate is unusable either
+	// way, and the sentinel is what the caller acts on.
+	_ = b.conn.Close()
+	return fmt.Errorf("%w: %s", ErrSubstrateAbandoned, reason)
+}
+
+// Abandoned reports whether Close closed the substrate. Tunnel.Close asks, because
+// device.Close swallows the error Close returns.
+func (b *Bind) Abandoned() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.abandoned
 }
 
 // Send writes each packet to the substrate. ep is ignored: the substrate is
