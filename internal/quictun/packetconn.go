@@ -34,23 +34,39 @@ type packetConn struct {
 	local     *net.UDPAddr
 	remote    *net.UDPAddr
 
-	// readMu serialises reads so Close can prove none is in flight before handing the
+	// reading serialises reads so Close can prove none is in flight before handing the
 	// substrate back. quic-go reads from a single goroutine, so it is uncontended.
-	readMu sync.Mutex
+	//
+	// A one-token channel rather than a mutex, because Close has to be able to give
+	// up: a substrate whose read deadlines do not work would never hand the token
+	// back, and sync.Mutex offers no way to stop waiting.
+	reading chan struct{}
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	closeErr  error
 }
+
+// closeGrace bounds how long Close waits for the reader to report back before
+// falling back to closing the substrate. It matches wireguard.Bind's constant, and
+// for the same reason: a read released by an expired deadline returns within
+// microseconds, so this is orders of magnitude of slack, while not waiting at all
+// would hand the next rung a substrate with a live reader still on it - and waiting
+// forever would mean a process that never exits.
+const closeGrace = 100 * time.Millisecond
 
 var _ net.PacketConn = (*packetConn)(nil)
 
 func newPacketConn(substrate net.Conn) *packetConn {
-	return &packetConn{
+	p := &packetConn{
 		substrate: substrate,
 		local:     pinAddr(substrate.LocalAddr(), 1),
 		remote:    pinAddr(substrate.RemoteAddr(), 2),
+		reading:   make(chan struct{}, 1),
 		closed:    make(chan struct{}),
 	}
+	p.reading <- struct{}{}
+	return p
 }
 
 // pinAddr resolves one end of the substrate to a fixed *net.UDPAddr, captured once.
@@ -68,8 +84,8 @@ func pinAddr(addr net.Addr, seq byte) *net.UDPAddr {
 }
 
 func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	p.readMu.Lock()
-	defer p.readMu.Unlock()
+	<-p.reading
+	defer func() { p.reading <- struct{}{} }()
 
 	select {
 	case <-p.closed:
@@ -108,18 +124,45 @@ func (p *packetConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 // return before restoring the zero deadline - so the next tier inherits a conn with
 // no stale deadline and no reader still holding a claim on the next datagram.
 //
-// It must not be called from the goroutine doing the reading, which would deadlock on
-// readMu. quic-go never does: with a caller-supplied Conn it leaves closing to us.
+// The wait is bounded. Whether the past deadline worked cannot be inferred from its
+// error - ice.Conn implements SetReadDeadline as a stub that returns nil without
+// recording anything, and that is the substrate this runs on in production - so the
+// only evidence is the reader reporting back. If it does not within closeGrace, the
+// substrate is closed instead: a reader that cannot be released has already made it
+// unusable for whatever comes next, and QUIC is the last rung above the libp2p
+// floor, which does not use the substrate at all. wireguard.Bind.Close makes the
+// same trade for the same reason.
+//
+// It must not be called from the goroutine doing the reading, which would spend the
+// whole grace period waiting for itself. quic-go never does: with a caller-supplied
+// Conn it leaves closing to us.
 func (p *packetConn) Close() error {
-	p.closeOnce.Do(func() {
-		close(p.closed)
-		_ = p.substrate.SetReadDeadline(time.Now())
+	p.closeOnce.Do(func() { p.closeErr = p.detach() })
+	return p.closeErr
+}
 
-		p.readMu.Lock()
-		defer p.readMu.Unlock()
+func (p *packetConn) detach() error {
+	close(p.closed)
+	_ = p.substrate.SetReadDeadline(time.Now())
+
+	timer := time.NewTimer(closeGrace)
+	defer timer.Stop()
+
+	select {
+	case <-p.reading:
+		// The reader is out of the substrate's Read, so the deadline that released it
+		// has done its job and must go: the substrate outlives this conn, and one
+		// left permanently in the past would fail every read the next rung makes.
 		_ = p.substrate.SetReadDeadline(time.Time{})
-	})
-	return nil
+		// Hand the token back so a later ReadFrom still terminates - it sees closed
+		// and returns net.ErrClosed rather than blocking on a token nobody holds.
+		p.reading <- struct{}{}
+		return nil
+	case <-timer.C:
+		// Deliberately no SetReadDeadline(time.Time{}) here: the expired deadline is
+		// the only thing still trying to release the parked reader.
+		return p.substrate.Close()
+	}
 }
 
 func (p *packetConn) LocalAddr() net.Addr { return p.local }

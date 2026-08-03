@@ -371,9 +371,11 @@ func TestMuxDropsUnaddressableMessages(t *testing.T) {
 		t.Fatalf("AcceptStream = %v, want the runt messages to have been dropped", err)
 	}
 
-	// The receive loop must still be running afterwards.
+	// The receive loop must still be running afterwards. The ID is even because the
+	// sender here is the dialling side, and only that half of the space may open a
+	// flow on the accepter - see lookupOrCreate.
 	frame := make([]byte, Header+1)
-	binary.BigEndian.PutUint32(frame[:Header], 7)
+	binary.BigEndian.PutUint32(frame[:Header], 8)
 	frame[Header] = 'k'
 	if err := dialChan.send(frame); err != nil {
 		t.Fatalf("send: %v", err)
@@ -549,5 +551,69 @@ func TestMuxCloseIsIdempotent(t *testing.T) {
 		if err := dialer.Close(); err != nil {
 			t.Fatalf("close %d: %v", i, err)
 		}
+	}
+}
+
+// The ID namespace split is an invariant, not a convention: a peer that creates a
+// flow in this side's half would have it silently replaced the moment OpenStream
+// reached that ID, leaving two streams stamped identically on the wire.
+func TestMuxRejectsFlowInLocalNamespace(t *testing.T) {
+	t.Parallel()
+
+	dialChan, acceptChan := newChannelPair()
+	defer close(dialChan.closed)
+
+	var (
+		mu      sync.Mutex
+		dropped []uint32
+	)
+	dialer := New(Config{
+		Send:    dialChan.send,
+		Recv:    dialChan.recv,
+		Dialing: true,
+		OnDrop: func(id uint32, _ string) {
+			mu.Lock()
+			defer mu.Unlock()
+			dropped = append(dropped, id)
+		},
+	})
+	defer func() { _ = dialer.Close() }()
+
+	// 0 is the dialling side's own first ID, so the peer must not be able to open a
+	// flow there.
+	frame := make([]byte, Header+1)
+	binary.BigEndian.PutUint32(frame[:Header], 0)
+	frame[Header] = 'x'
+	if err := acceptChan.send(frame); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := dialer.AcceptStream(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcceptStream = %v, want the local-namespace flow to have been refused", err)
+	}
+	mu.Lock()
+	got := append([]uint32(nil), dropped...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("dropped = %v, want exactly [0]", got)
+	}
+
+	// The ID must still be usable by this side afterwards, with nothing stale left
+	// behind for it to collide with.
+	s, err := dialer.OpenStream(testCtx(t))
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := s.Write([]byte("hi")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	sent := dialChan.messages()
+	if len(sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(sent))
+	}
+	if id := binary.BigEndian.Uint32(sent[0][:Header]); id != 0 {
+		t.Fatalf("OpenStream used flow ID %d, want 0", id)
 	}
 }

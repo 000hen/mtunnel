@@ -504,7 +504,7 @@ func negotiateTierHost(ctx context.Context, opts Options, ids tierIdentities, de
 	// two upper branches each add messages to the exchange, and one side taking a
 	// different branch would strand the other.
 	switch {
-	case negotiate.SharedCascade(local.SupportedTiers, peerHello.SupportedTiers)[0] != negotiate.TierLibp2p:
+	case tier != negotiate.TierLibp2p:
 		serveUpperTiers(ctx, exchange, opts, ids, peerHello, deps, s)
 	case probeAgreed(local, peerHello):
 		// The punch probe runs inline rather than in its own goroutine because libp2p
@@ -943,6 +943,12 @@ func punch(ctx context.Context, x *negotiate.Exchange, opts Options, controlling
 	}
 	if err != nil {
 		// Already reported as gather-failed; the send above was purely for the peer.
+		// The nil check matches the exchange path above: a factory that reports an
+		// agent alongside an error still handed one over, and this function promises
+		// it releases everything on failure.
+		if agent != nil {
+			_ = agent.Close()
+		}
 		return punchResult{}, err
 	}
 

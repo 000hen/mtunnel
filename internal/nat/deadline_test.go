@@ -316,3 +316,157 @@ func TestDeadlineConnRestoresBufferCapacity(t *testing.T) {
 		t.Fatalf("Read = %d bytes, want %d: the buffer pool shrank", n, substrateMTU)
 	}
 }
+
+// The defect this guards against: a Read that is *already* parked must observe a
+// deadline set after it started. wireguard-go's device.Close and quic-go's
+// Transport.Close both release their read loop exactly this way - the loop is
+// blocked when the deadline arrives, never before - so a deadline only a
+// *subsequent* Read can see is no deadline at all. Miss it and wireguard's
+// Bind.Close falls through to closing the shared substrate, leaving the next
+// cascade rung with nothing to run on.
+func TestDeadlineConnReleasesBlockedRead(t *testing.T) {
+	t.Parallel()
+
+	sub := newFakeSubstrate()
+	c := withDeadlines(sub)
+	defer sub.Close()
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 64))
+		blocked <- err
+	}()
+
+	// Let the Read reach its select before the deadline is set, so this exercises
+	// the parked path rather than the pre-armed one the other tests cover.
+	time.Sleep(50 * time.Millisecond)
+	if err := c.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("blocked Read err = %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetReadDeadline did not release an already-blocked Read")
+	}
+	if n := sub.closeCount(); n != 0 {
+		t.Fatalf("substrate closed %d times; releasing a read must not touch it", n)
+	}
+}
+
+// A timer-driven expiry must reach a Read that parked before the timer fired, and
+// clearing the deadline afterwards must leave the conn usable - that pair is the
+// whole hand-off a cascade rung performs when it passes the substrate on.
+func TestDeadlineConnTimerReleasesBlockedRead(t *testing.T) {
+	t.Parallel()
+
+	sub := newFakeSubstrate()
+	c := withDeadlines(sub)
+	defer sub.Close()
+
+	if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 64))
+		blocked <- err
+	}()
+
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("blocked Read err = %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timer expiry did not release a blocked Read")
+	}
+
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline (zero): %v", err)
+	}
+	sub.send(t, "handed-off")
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after clearing an expired deadline: %v", err)
+	}
+	if got := string(buf[:n]); got != "handed-off" {
+		t.Fatalf("Read = %q, want %q", got, "handed-off")
+	}
+}
+
+// A timer callback that lost the race against a later set - already running, or
+// blocked on the mutex when Stop was called - must neither expire the deadline that
+// replaced it nor close a channel twice. Under -race this also covers concurrent
+// access to the deadline state itself.
+func TestDeadlineConnStaleTimerDoesNotExpireReplacement(t *testing.T) {
+	t.Parallel()
+
+	sub := newFakeSubstrate()
+	c := withDeadlines(sub)
+	defer sub.Close()
+
+	var churn sync.WaitGroup
+	for range 8 {
+		churn.Go(func() {
+			for range 200 {
+				_ = c.SetReadDeadline(time.Now().Add(time.Millisecond))
+				_ = c.SetReadDeadline(time.Time{})
+			}
+		})
+	}
+	churn.Wait()
+
+	// A cleared deadline must still be clear: had a stale timer expired the current
+	// channel, this Read would fail instead of delivering.
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline (zero): %v", err)
+	}
+	sub.send(t, "survived")
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after deadline churn: %v", err)
+	}
+	if got := string(buf[:n]); got != "survived" {
+		t.Fatalf("Read = %q, want %q", got, "survived")
+	}
+}
+
+// A pump that filled its queue while the consumer was gone is parked on channels no
+// socket close can reach, so Agent.Close has to release it explicitly. Without that
+// the goroutine, its buffer pool and its reference to the substrate outlive the
+// agent that claims to own them.
+func TestDeadlineConnStopReleasesParkedPump(t *testing.T) {
+	t.Parallel()
+
+	sub := newFakeSubstrate()
+	c := withDeadlines(sub)
+	defer sub.Close()
+
+	// Fill packets to capacity and drain free, without ever reading: the pump ends
+	// up blocked on <-c.free with every buffer outstanding.
+	for range substrateQueue {
+		sub.send(t, "backlog")
+	}
+	select {
+	case <-c.stopped:
+		t.Fatal("pump exited before it was stopped")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.stop()
+	select {
+	case <-c.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not release a pump parked on a full queue")
+	}
+	if n := sub.closeCount(); n != 0 {
+		t.Fatalf("substrate closed %d times; stop must leave it to the agent", n)
+	}
+}

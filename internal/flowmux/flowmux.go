@@ -196,7 +196,17 @@ func (m *Mux) receive() {
 
 		f, fresh := m.lookupOrCreate(id)
 		if f == nil {
-			return // closed underneath us
+			if m.stopped() {
+				return // closed underneath us
+			}
+			// The peer named an ID this side allocates and there is no such flow, so
+			// there is nothing to deliver to - see lookupOrCreate. Report it: a message
+			// that names an impossible flow is a peer bug or a stale frame, and both
+			// are worth seeing rather than silently discarding.
+			if m.cfg.OnDrop != nil {
+				m.cfg.OnDrop(id, "flow ID in local namespace")
+			}
+			continue
 		}
 		if fresh {
 			select {
@@ -216,7 +226,17 @@ func (m *Mux) receive() {
 
 // lookupOrCreate returns the flow for an inbound message, creating it if the peer has
 // just started it. fresh reports whether it was created, which is what tells the
-// receive loop to offer it to AcceptStream.
+// receive loop to offer it to AcceptStream. A nil flow means either the mux closed or
+// the ID was refused; the caller tells them apart with stopped.
+//
+// Creation is restricted to the peer's half of the ID space, which is what makes the
+// namespace split in New an invariant rather than a convention. A flow created at an
+// ID this side allocates would be overwritten the moment OpenStream reached that ID,
+// leaving two streams stamped identically on the wire and their traffic interleaved.
+//
+// Only creation is restricted. A data message or a FIN arriving on an ID this side
+// opened is the peer's half of that flow and is entirely legitimate - both find the
+// flow already in the table and never reach the check.
 func (m *Mux) lookupOrCreate(id uint32) (f *flow, fresh bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -227,9 +247,21 @@ func (m *Mux) lookupOrCreate(id uint32) (f *flow, fresh bool) {
 	if f, ok := m.flows[id]; ok {
 		return f, false
 	}
+	if (id&1 == 0) == m.cfg.Dialing {
+		return nil, false
+	}
 	f = newFlow(id, m)
 	m.flows[id] = f
 	return f, true
+}
+
+// stopped reports whether the mux has shut down, which is how receive distinguishes
+// a refused ID from a mux that closed underneath it.
+func (m *Mux) stopped() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.closed
 }
 
 // take removes a flow by ID and returns it, or nil if it was already gone.

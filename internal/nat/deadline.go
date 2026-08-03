@@ -56,17 +56,34 @@ type deadlineConn struct {
 	stopped chan struct{}
 	readErr error
 
+	// done releases the reader from the two channel operations no socket close can
+	// reach - waiting for a free buffer, and handing a datagram to a consumer that
+	// has stopped taking them. Closing the substrate only unblocks a reader parked in
+	// Read, so without this a pump that filled its queue during teardown would
+	// outlive the agent. stop is the one writer.
+	done     chan struct{}
+	stopOnce sync.Once
+
 	mu    sync.Mutex
 	read  deadline
 	write deadline
 }
 
 // deadline is one direction's deadline: a channel closed when it expires, plus the
-// timer that will close it. A fresh channel per SetDeadline is what makes extending
-// an already-expired deadline work.
+// timer that will close it.
+//
+// The channel is long-lived on purpose. A Read parked in its select holds whatever
+// channel was current when it started, so expiring a *replacement* channel would be
+// invisible to it - and releasing an already-blocked read is the entire reason this
+// type exists. Only one case forces a new channel: extending a deadline that has
+// already fired, since a closed channel cannot be reopened. fired records that, and
+// gen lets a timer callback that lost a race against a later set recognise itself as
+// stale.
 type deadline struct {
 	expired chan struct{}
 	timer   *time.Timer
+	fired   bool
+	gen     uint64
 }
 
 // withDeadlines wraps a punched conn. The wrapper does not take ownership: closing it
@@ -78,6 +95,12 @@ func withDeadlines(substrate net.Conn) *deadlineConn {
 		packets: make(chan []byte, substrateQueue),
 		free:    make(chan []byte, substrateQueue),
 		stopped: make(chan struct{}),
+		done:    make(chan struct{}),
+		// Both channels exist from the start. A Read that runs before any deadline is
+		// set still has to park on the same channel a later SetReadDeadline will close,
+		// or that read would never learn the deadline arrived - see deadline.
+		read:  deadline{expired: make(chan struct{})},
+		write: deadline{expired: make(chan struct{})},
 	}
 	for range substrateQueue {
 		c.free <- make([]byte, substrateMTU)
@@ -86,20 +109,46 @@ func withDeadlines(substrate net.Conn) *deadlineConn {
 	return c
 }
 
-// pump moves datagrams off the substrate until it fails. It exits on any read error,
-// including the closed-conn error Agent.Close produces, and records it for Read.
+// pump moves datagrams off the substrate until it fails or is stopped. It exits on
+// any read error, including the closed-conn error Agent.Close produces, and records
+// it for Read.
+//
+// Both channel operations are guarded by done. Neither can be released by closing
+// the substrate - a pump waiting for a free buffer, or offering a datagram to a
+// consumer that has stopped reading, is waiting on this conn's own channels - and
+// teardown produces exactly that state: the consumer stops first, the peer keeps
+// sending, and substrateQueue datagrams later the pump is parked.
 func (c *deadlineConn) pump() {
 	defer close(c.stopped)
 
 	for {
-		buf := <-c.free
+		var buf []byte
+		select {
+		case buf = <-c.free:
+		case <-c.done:
+			c.readErr = net.ErrClosed
+			return
+		}
+
 		n, err := c.Conn.Read(buf)
 		if err != nil {
 			c.readErr = err
 			return
 		}
-		c.packets <- buf[:n]
+
+		select {
+		case c.packets <- buf[:n]:
+		case <-c.done:
+			c.readErr = net.ErrClosed
+			return
+		}
 	}
+}
+
+// stop releases the pump. It is idempotent, and it does not touch the substrate:
+// ownership of that stays with the ICE agent, which closes it separately.
+func (c *deadlineConn) stop() {
+	c.stopOnce.Do(func() { close(c.done) })
 }
 
 // Read returns the next datagram, truncating it to len(p) exactly as a UDP socket
@@ -158,8 +207,8 @@ func (c *deadlineConn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.read.set(t)
-	c.write.set(t)
+	c.set(&c.read, t)
+	c.set(&c.write, t)
 	return nil
 }
 
@@ -167,7 +216,7 @@ func (c *deadlineConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.read.set(t)
+	c.set(&c.read, t)
 	return nil
 }
 
@@ -175,33 +224,58 @@ func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.write.set(t)
+	c.set(&c.write, t)
 	return nil
 }
 
-// set replaces the deadline. The caller holds the mutex.
+// set replaces one direction's deadline. The caller holds the mutex.
 //
-// Every call installs a fresh channel rather than reusing the old one, because an
-// expired deadline is expressed by a closed channel and a closed channel cannot be
-// reopened - which is exactly what a caller extending a deadline it had already let
-// expire needs.
-func (d *deadline) set(t time.Time) {
+// The existing channel is kept unless it has already been closed. That is what makes
+// a deadline set in the past release a Read that is *already* blocked: the read is
+// parked on the channel that was current when it started, so a replacement channel
+// would expire unobserved and the read would hang forever. Every consumer of a
+// punched substrate depends on that release - it is how a cascade rung hands the
+// substrate to the next rung without closing a conn it does not own.
+//
+// A channel that already fired cannot be reopened, so extending an expired deadline
+// is the one case that allocates.
+func (c *deadlineConn) set(d *deadline, t time.Time) {
 	if d.timer != nil {
 		d.timer.Stop()
 		d.timer = nil
 	}
+	// Bump the generation unconditionally, so a timer callback already past its
+	// Stop - running, or blocked on this very mutex - recognises itself as stale
+	// instead of expiring the deadline this call is installing.
+	d.gen++
+	if d.expired == nil || d.fired {
+		d.expired = make(chan struct{})
+		d.fired = false
+	}
 	if t.IsZero() {
 		// No deadline: a channel nothing ever closes is what "never expires" looks
 		// like to the select in Read.
-		d.expired = make(chan struct{})
 		return
 	}
-
-	expired := make(chan struct{})
-	d.expired = expired
+	gen := d.gen
 	if remaining := time.Until(t); remaining > 0 {
-		d.timer = time.AfterFunc(remaining, func() { close(expired) })
+		d.timer = time.AfterFunc(remaining, func() { c.expire(d, gen) })
 		return
 	}
-	close(expired)
+	d.fired = true
+	close(d.expired)
+}
+
+// expire fires a deadline from its timer, unless a later set has superseded it.
+// Stop cannot make that guarantee on its own: a callback already running, or already
+// blocked on the mutex, outlives the Stop that was meant to cancel it.
+func (c *deadlineConn) expire(d *deadline, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if d.gen != gen || d.fired {
+		return
+	}
+	d.fired = true
+	close(d.expired)
 }

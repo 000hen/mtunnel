@@ -112,6 +112,12 @@ type Agent struct {
 	remoteTypes []string
 	hasRemote   bool
 
+	// conn is the wrapper Connect handed out, kept so Close can release its reader.
+	// mu guards it: Connect and Close are sequential in every caller here, but that
+	// is a convention, not something the type can enforce.
+	mu   sync.Mutex
+	conn *deadlineConn
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -308,13 +314,31 @@ func (a *Agent) Connect(ctx context.Context, controlling bool) (net.Conn, error)
 		return nil, fmt.Errorf("ICE connect as %s: %w", role, err)
 	}
 	a.logPunch(role, "connected", time.Since(start), nil)
-	return withDeadlines(conn), nil
+
+	wrapped := withDeadlines(conn)
+	a.mu.Lock()
+	a.conn = wrapped
+	a.mu.Unlock()
+	return wrapped, nil
 }
 
 // Close releases the agent and everything derived from it, including a conn a
 // successful Connect handed back. It is safe to call more than once.
+//
+// The wrapper is stopped before the agent, not after: closing the agent releases a
+// reader parked in the substrate's Read, but a reader parked on the wrapper's own
+// channels - the state teardown produces once the consumer stops draining - can only
+// be released from this side.
 func (a *Agent) Close() error {
-	a.closeOnce.Do(func() { a.closeErr = a.agent.Close() })
+	a.closeOnce.Do(func() {
+		a.mu.Lock()
+		conn := a.conn
+		a.mu.Unlock()
+		if conn != nil {
+			conn.stop()
+		}
+		a.closeErr = a.agent.Close()
+	})
 	return a.closeErr
 }
 
