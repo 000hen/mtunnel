@@ -66,13 +66,56 @@ func ParseDHTMode(value string) (DHTMode, error) {
 	}
 }
 
+// TunnelMode selects which data-plane tier carries forwarded traffic. "auto"
+// negotiates the best tier both sides support and falls back through the cascade
+// when one does not come up; the named modes force a single tier and fail rather
+// than fall back, which is what makes them useful for isolating a tier under test.
+type TunnelMode string
+
+const (
+	TunnelAuto      TunnelMode = "auto"
+	TunnelWireGuard TunnelMode = "wireguard"
+	TunnelQUIC      TunnelMode = "quic"
+	TunnelLibp2p    TunnelMode = "libp2p"
+)
+
+func ParseTunnelMode(value string) (TunnelMode, error) {
+	mode := TunnelMode(strings.ToLower(value))
+	switch mode {
+	case TunnelAuto, TunnelWireGuard, TunnelQUIC, TunnelLibp2p:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported tunnel mode %q (want auto, wireguard, quic, or libp2p)", value)
+	}
+}
+
 // Config contains the libp2p settings shared by host creation, stream policy,
 // and diagnostics. Defaults are selected by the CLI.
 type Config struct {
 	ConnectionMode    ConnectionMode
 	Transport         TransportMode
 	DHTMode           DHTMode
+	TunnelMode        TunnelMode
 	DirectDialTimeout time.Duration
 	Diagnostic        bool
 	RelayAddrs        []string
+
+	// Protocols is the generation of tunnel protocol IDs this side speaks. The
+	// host serves its own (CurrentProtocols); the client resolves the host's from
+	// the token version it was given, so which channel a stream opens on is
+	// derived from the token rather than assumed at each call site.
+	//
+	// The zero value means CurrentProtocols, so a Config built before a token has
+	// been decoded - which is every Config the CLI builds - is already correct for
+	// the host role and for anything that does not dial.
+	Protocols Protocols
+}
+
+// protocols resolves the configured protocol generation, so the stream helpers
+// read one value rather than repeating the zero check at each call site.
+func (c Config) protocols() Protocols {
+	if c.Protocols.Data == "" || c.Protocols.Negotiate == "" {
+		return CurrentProtocols()
+	}
+	return c.Protocols
 }

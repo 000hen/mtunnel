@@ -18,8 +18,8 @@ type Transport struct{ diagnostic bool }
 // New returns a TCP transport.
 func New(diagnostic bool) Transport { return Transport{diagnostic: diagnostic} }
 
-// Network returns the canonical network name.
-func (Transport) Network() string { return "tcp" }
+// Network returns the network this transport forwards.
+func (Transport) Network() transport.Network { return transport.NetworkTCP }
 
 // Forward bridges an inbound tunnel stream and the host's local TCP connection.
 func (t Transport) Forward(s transport.Stream, local net.Conn) { pipe(s, local, t.diagnostic) }

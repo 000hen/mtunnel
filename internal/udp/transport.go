@@ -15,8 +15,8 @@ type Transport struct{}
 // New returns a UDP transport.
 func New() Transport { return Transport{} }
 
-// Network returns the canonical network name.
-func (Transport) Network() string { return "udp" }
+// Network returns the network this transport forwards.
+func (Transport) Network() transport.Network { return transport.NetworkUDP }
 
 // Forward bridges an inbound tunnel stream and the host's local UDP connection,
 // preserving datagram boundaries.

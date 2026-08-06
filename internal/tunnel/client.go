@@ -35,6 +35,17 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 		return err
 	}
 
+	// Which protocol generation to dial comes from the token, not from a constant
+	// read at each call site. DecodeToken has already refused a version this build
+	// cannot reach, so this cannot fail; resolving it once here is what keeps every
+	// stream this client opens - data and negotiate alike - on the host's generation.
+	protocols, err := p2p.ProtocolsFor(decodedToken.Version)
+	if err != nil {
+		_ = h.Close()
+		return err
+	}
+	opts.P2P.Protocols = protocols
+
 	// The DHT shares the client's lifetime: it is created with ctx and closed during
 	// cleanup, so it stays usable for the whole discovery phase.
 	clientDHT, err := p2p.NewDHT(ctx, h, false, opts.P2P.DHTMode)
@@ -62,27 +73,73 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 		return fmt.Errorf("connect to peer %s: %w", decodedToken.ID, err)
 	}
 
+	// Build this run's data plane before negotiating, because the client advertises
+	// its credentials in the opening exchange: the WireGuard public key in Hello, the
+	// certificate fingerprint in PunchInfo. Nothing here is persisted, matching the
+	// host's and the libp2p peer identity's.
+	ts, err := newTiers(opts)
+	if err != nil {
+		p2p.Close(clientDHT, h)
+		return err
+	}
+
+	// Negotiate the tunnel tier once per session, immediately after connecting and
+	// before any forwarded connection can open a data stream, then climb the fallback
+	// ladder to whatever will actually carry traffic. In auto mode this is
+	// best-effort and cannot fail the session - the libp2p floor always works - but a
+	// forced -tunnel-mode returns the error instead of being rescued by it. See
+	// negotiateTierClient.
+	//
+	// wg is declared here rather than beside the forwarder because negotiation may
+	// leave a background NAT punch probe running, and shutdown has to wait for it.
+	var wg sync.WaitGroup
+	plane, err := negotiateTierClient(ctx, h, decodedToken.ID, opts, ts, decodedToken.WireGuardPubKey, t.Network(), &wg)
+	if err != nil {
+		cancel()
+		p2p.Close(clientDHT, h)
+		wg.Wait()
+		return err
+	}
+
 	if opts.P2P.DHTMode == p2p.DHTCloseAfterConnect {
 		if err := clientDHT.Close(); err != nil {
+			// cancel before waiting: the background punch probe launched above is
+			// still running on ctx, and without this the wait would last until its
+			// own timeouts expire rather than until it notices the abort.
+			cancel()
+			_ = plane.close()
 			p2p.Close(nil, h)
+			wg.Wait()
 			return fmt.Errorf("close client DHT after connect: %w", err)
 		}
 		clientDHT = nil
 		log.Println("Client DHT closed after discovery and connection")
 	}
 	if opts.P2P.Diagnostic {
-		go p2p.StartDiagnostics(ctx, h, clientDHT, decodedToken.ID, opts.Bandwidth)
+		// The client's tier is resolved for the whole session by the time diagnostics
+		// start, so unlike the host's this reporter is a constant.
+		go p2p.StartDiagnostics(ctx, h, clientDHT, decodedToken.ID, opts.Bandwidth, func() string {
+			return string(plane.selected)
+		})
 	}
 
 	// Shut the client down if the host goes away entirely.
 	watcher := newRemoteDisconnectWatcher(decodedToken.ID, requestShutdown)
 	h.Network().Notify(watcher)
 
-	opener := streamOpener{h: h, target: decodedToken.ID, config: opts.P2P}
+	// A tier above the floor brings its own opener; on the floor there is nothing to
+	// substitute and forwarded connections ride libp2p streams exactly as before.
+	var opener transport.Opener = streamOpener{h: h, target: decodedToken.ID, config: opts.P2P}
+	if plane.opener != nil {
+		opener = plane.opener
+	}
 	forwarder, err := t.Listen(ctx, opener, localPort)
 	if err != nil {
 		h.Network().StopNotify(watcher)
+		cancel() // as above: abort the background probe before waiting on it
+		_ = plane.close()
 		p2p.Close(clientDHT, h)
+		wg.Wait()
 		return fmt.Errorf("listen on local port %d: %w", localPort, err)
 	}
 
@@ -91,18 +148,25 @@ func RunClient(ctx context.Context, h host.Host, emitter *control.Emitter, token
 		Action:    control.CONNECTED,
 		SessionId: h.ID(),
 		Port:      forwarder.Port(),
+		Tier:      plane.selected,
 	})
 
-	var wg sync.WaitGroup
 	wg.Go(forwarder.Serve)
 
 	<-ctx.Done()
 	log.Println("Initiating graceful shutdown...")
 
-	// Stop watching, stop accepting, then close the libp2p stack (which unblocks any
-	// in-flight pipes) before waiting for the forwarder to drain.
+	// Stop watching, stop accepting, tear the tier down, then close the libp2p stack,
+	// before waiting for the forwarder to drain.
+	//
+	// The tier teardown sits between the two deliberately. Closing the libp2p stack
+	// unblocks in-flight pipes on the libp2p floor and nothing else; a tier above it
+	// has its own substrate to release, and a pipe still riding that substrate would
+	// keep the wait below going forever. On the floor this step is a no-op, so the
+	// shape stays the same whichever tier won.
 	h.Network().StopNotify(watcher)
 	_ = forwarder.Close()
+	_ = plane.close()
 	p2p.Close(clientDHT, h)
 	wg.Wait()
 
