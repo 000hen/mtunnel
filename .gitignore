@@ -6,3 +6,4 @@
 
 # Crash residue from the MSYS/Cygwin shell, not produced by this project
 *.stackdump
+plan/
