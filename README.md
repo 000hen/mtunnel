@@ -40,7 +40,7 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 
 - `-port` is the local port on the host that should receive forwarded traffic.
 - `-network` controls the socket type (`tcp` default, or `udp`). UDP is carried as length-prefixed datagrams over one tunnel stream per source flow, with idle flows reaped automatically.
-- The process prints a base64-encoded connection token to stdout and also emits a JSON event for automation. Share this token with clients.
+- The process prints a base64-encoded connection token to stdout and also emits a JSON event for automation. Share this token with clients. The token carries the version of the build that issued it — see [Versions and compatibility](#versions-and-compatibility).
 
 ### Client mode (consume a forwarded service)
 
@@ -52,6 +52,24 @@ Both roles use the same binary. Omitting the `-token` flag starts host mode; pro
 - `-port` is the local listener port. Set `0` to let the OS pick a free port (the program prints the chosen port).
 - `-network` must match the host's setting.
 - Once connected, any TCP or UDP client hitting the local port will tunnel traffic to the host's service.
+
+### Versions and compatibility
+
+Both peers must run the same tunnel generation. This build is **generation 2**, and
+the token it prints carries a version so a mismatch is reported as one:
+
+| Situation | What happens |
+| --- | --- |
+| Both peers on this build | Normal operation |
+| This client, token from an original (pre-versioning) host | The client refuses the token immediately, before any network activity: *"the token carries no version … upgrade the host"* |
+| Original client, token from this host | The token still decodes — the old build ignores the fields it does not know — and discovery and connection succeed, but every forwarded connection then fails: it asks for `/mtunnel/1.0.0` and this build serves `/mtunnel/2.0.0`. This is the one direction the old build cannot report clearly, which is why the version exists. Upgrade the client. |
+| This client, token from a newer build | *"token version N is newer than this build's … upgrade the client"* |
+
+The split is deliberate. The libp2p protocol IDs moved with the generation so that
+two incompatible builds fail at the first contact rather than half-negotiating a
+tunnel and failing somewhere less obvious. Adding a field to the token stays
+compatible in both directions; anything that changes an existing field's meaning
+takes a new token version.
 
 ### Tunnel tiers
 
@@ -177,6 +195,11 @@ Each event includes the action name plus auxiliary fields such as `token`, `addr
   real devices over an in-memory bind, and `internal/tunnel`'s cascade tests run
   the real fallback ladder over a loopback socket pair with only the NAT punch
   substituted. Run them with `-race`, since most of that code is concurrent.
+- Tiers sit behind one interface in `internal/tier`. Adding one is a file
+  implementing `tier.Tier`, an entry in that package's `implementations` table
+  pairing it with its per-run credential, and a constant in `internal/negotiate`'s
+  cascade. The orchestration in `internal/tunnel` does not change, and startup
+  panics if those three ever disagree.
 - Control events use stdout. Diagnostic JSON logs use stderr so test runs can
   capture them independently.
 

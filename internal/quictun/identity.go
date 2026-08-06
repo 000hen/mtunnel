@@ -17,7 +17,14 @@ import (
 // alpn identifies this tunnel's use of QUIC. Both sides must offer it or the
 // handshake fails, which is a cheap guard against pointing the tier at something
 // else that happens to speak QUIC on the same substrate.
-const alpn = "mtunnel/1"
+//
+// The generation tracks p2p.ProtocolGeneration by hand rather than by import,
+// because this package is deliberately libp2p-free and importing p2p to read one
+// integer would be the first crack in that. Two generations can never meet here in
+// practice - they share no libp2p protocol ID, so they never get as far as
+// negotiating a tier - so this is defence in depth, and bumping it alongside the
+// protocol IDs keeps it honest if that ever stops being true.
+const alpn = "mtunnel/2"
 
 // certLifetime is generous because it is very nearly irrelevant: verification is
 // pinned to a fingerprint rather than a chain, so expiry is never consulted. It

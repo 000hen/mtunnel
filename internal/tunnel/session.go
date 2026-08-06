@@ -166,7 +166,7 @@ func (sm *SessionManager) BeginStream(id peer.ID, conn network.Conn) bool {
 		Action:    control.CONNECTED,
 		SessionId: id,
 		Addr:      conn.RemoteMultiaddr().String(),
-		Tier:      string(tier),
+		Tier:      tier,
 	})
 
 	return true
@@ -254,15 +254,17 @@ func (sm *SessionManager) ActiveTier() string {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	var tiers []string
+	var tiers []negotiate.Tier
 	for _, session := range sm.sessions {
-		if tier := string(session.Tier); !slices.Contains(tiers, tier) {
-			tiers = append(tiers, tier)
+		if !slices.Contains(tiers, session.Tier) {
+			tiers = append(tiers, session.Tier)
 		}
 	}
 	slices.Sort(tiers)
 
-	return strings.Join(tiers, ",")
+	// Rendered only here, at the edge, because the diagnostic record wants one
+	// field rather than a list. Everything above this line is still a tier.
+	return strings.Join(tiersToStrings(tiers), ",")
 }
 
 // Shutdown stops accepting new tunnel streams, forcibly resets every active one,

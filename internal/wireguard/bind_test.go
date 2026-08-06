@@ -26,6 +26,14 @@ type fakeConn struct {
 	reads chan []byte
 	errs  chan error
 
+	// reading is signalled as a Read is entered, i.e. once it is past the point
+	// where Bind's receive could still notice the close on its own. Tests that need
+	// the receive genuinely parked in the substrate - the ordering Close's fallback
+	// exists for - wait on this rather than sleeping: a sleep only makes that
+	// ordering likely, and a loaded machine that misses the window turns the case
+	// under test into the case that was already passing.
+	reading chan struct{}
+
 	mu       sync.Mutex
 	writes   [][]byte
 	closes   int
@@ -47,6 +55,7 @@ func newFakeConn() *fakeConn {
 	return &fakeConn{
 		reads:    make(chan []byte),
 		errs:     make(chan error),
+		reading:  make(chan struct{}, 1),
 		deadline: make(chan struct{}),
 		gone:     make(chan struct{}),
 		remote:   &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51820},
@@ -54,6 +63,13 @@ func newFakeConn() *fakeConn {
 }
 
 func (c *fakeConn) Read(p []byte) (int, error) {
+	// Buffered and non-blocking, so a Read entered before anyone is waiting still
+	// records that it happened and a test that never waits is not held up by one.
+	select {
+	case c.reading <- struct{}{}:
+	default:
+	}
+
 	select {
 	case b, ok := <-c.reads:
 		if !ok {
@@ -177,6 +193,17 @@ func receiveOnce(recv conn.ReceiveFunc) <-chan received {
 	return out
 }
 
+// awaitReading blocks until the substrate has a Read in flight, which is the state
+// Bind's receive loop has to be in for a test to exercise how Close gets it out.
+func (c *fakeConn) awaitReading(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.reading:
+	case <-time.After(5 * time.Second):
+		t.Fatal("receive never reached the substrate")
+	}
+}
+
 func await(t *testing.T, out <-chan received) received {
 	t.Helper()
 	select {
@@ -247,7 +274,7 @@ func TestBindCloseUnblocksReceive(t *testing.T) {
 	out := receiveOnce(recv)
 	// Let the receive reach its blocking Read before closing, which is the ordering
 	// that actually hangs if Close only sets a flag.
-	time.Sleep(20 * time.Millisecond)
+	substrate.awaitReading(t)
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -276,7 +303,7 @@ func TestBindCloseRestoresReadDeadline(t *testing.T) {
 	out := receiveOnce(recv)
 	// As in TestBindCloseUnblocksReceive: reach the blocking Read first, so Close
 	// takes the path that actually sets a deadline.
-	time.Sleep(20 * time.Millisecond)
+	substrate.awaitReading(t)
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -335,8 +362,9 @@ func TestBindCloseSurvivesStubbedDeadlines(t *testing.T) {
 
 	out := receiveOnce(recv)
 	// As in TestBindCloseUnblocksReceive: the receive has to be parked inside Read
-	// before Close runs, or the case that hangs is never reached.
-	time.Sleep(20 * time.Millisecond)
+	// before Close runs, or the case that hangs is never reached - and here that
+	// would not fail the test, it would quietly pass it against the wrong path.
+	substrate.awaitReading(t)
 
 	done := make(chan error, 1)
 	go func() { done <- b.Close() }()

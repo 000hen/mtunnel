@@ -128,7 +128,7 @@ func TestBeginStreamReportsRegisteredTier(t *testing.T) {
 			if len(emitted) != 1 || emitted[0].Action != control.CONNECTED {
 				t.Fatalf("emitted %+v, want one CONNECTED event", emitted)
 			}
-			if emitted[0].Tier != string(tt.want) {
+			if emitted[0].Tier != tt.want {
 				t.Errorf("CONNECTED reported tier %q, want %q", emitted[0].Tier, tt.want)
 			}
 		})

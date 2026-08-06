@@ -21,7 +21,7 @@ import (
 // forwards each inbound tunnel stream to the local service on forwardPort. It
 // returns when ctx is cancelled and shutdown completes. RunHost takes ownership of
 // h and closes it before returning.
-func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, networkType string, forwardPort int, opts Options) error {
+func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, networkType transport.Network, forwardPort int, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -51,18 +51,23 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 
 	p2p.LogAddrs(h)
 
-	// Generate this run's tier credentials - a static WireGuard keypair and a
-	// self-signed QUIC leaf - and publish the WireGuard public key in the token. Like
-	// the libp2p peer identity, none of it is persisted. Both are generated regardless
-	// of tunnel mode: a client decides which tier to ask for, and a host that withheld
-	// a credential would force the floor on every one of them.
-	ids, err := newTierIdentities()
+	// Build this run's data plane - the tier registry and the credentials it serves
+	// with - and publish the WireGuard public key in the token. Like the libp2p peer
+	// identity, none of it is persisted.
+	ts, err := newTiers(opts)
 	if err != nil {
 		p2p.Close(idht, h)
 		return err
 	}
 
-	encodedToken, err := p2p.Token{Network: t.Network(), ID: h.ID(), WireGuardPubKey: ids.wg.public}.Encode()
+	// The token carries no version field of its own to fill in: Token.Encode stamps
+	// the current one, which is what tells an older client to stop rather than to
+	// speak a protocol this build no longer serves.
+	encodedToken, err := p2p.Token{
+		Network:         t.Network(),
+		ID:              h.ID(),
+		WireGuardPubKey: ts.ids.WireGuardPublicKey(),
+	}.Encode()
 	if err != nil {
 		p2p.Close(idht, h)
 		return err
@@ -84,7 +89,7 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 		// Registered before announcing readiness so that an eager client cannot
 		// connect during a window where no handler is installed.
 		h.SetStreamHandler(p2p.ProtocolID, func(s network.Stream) {
-			p2p.LogStreamPath("accepted", s, opts.P2P.Diagnostic)
+			p2p.LogStreamPath(p2p.StreamAccepted, s, opts.P2P.Diagnostic)
 			remote := s.Conn().RemotePeer()
 			if !session.BeginStream(remote, s.Conn()) {
 				// The host is shutting down and no longer serving streams.
@@ -107,7 +112,7 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 	// exchange itself, so shutdown has to wait for them rather than close the libp2p
 	// stack out from under them.
 	var negotiations handlerGroup
-	deps := hostTierDeps{session: session, transport: t, localAddr: addr}
+	deps := hostTierDeps{tiers: ts, session: session, transport: t, localAddr: addr}
 	h.SetStreamHandler(p2p.NegotiateProtocolID, func(s network.Stream) {
 		if !negotiations.begin() {
 			// Shutting down and no longer negotiating.
@@ -116,7 +121,7 @@ func RunHost(ctx context.Context, h host.Host, emitter *control.Emitter, network
 		}
 		defer negotiations.done()
 
-		negotiateTierHost(ctx, opts, ids, deps, s)
+		negotiateTierHost(ctx, opts, deps, s)
 	})
 
 	announceToken(emitter, encodedToken)
@@ -166,7 +171,9 @@ func handleHostStream(ctx context.Context, t transport.Transport, s transport.St
 	defer s.Close()
 
 	dialer := net.Dialer{Timeout: defaultLocalDialTimeout}
-	localConn, err := dialer.DialContext(ctx, t.Network(), addr)
+	// transport.Network's underlying string is the net package's network name, which
+	// is why it is a named string rather than an integer - see transport.Network.
+	localConn, err := dialer.DialContext(ctx, string(t.Network()), addr)
 	if err != nil {
 		log.Printf("Failed to connect to local service on %s: %v", addr, err)
 		return

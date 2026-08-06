@@ -21,12 +21,12 @@ import (
 func OpenNegotiateStream(ctx context.Context, h host.Host, target peer.ID, cfg Config) (network.Stream, error) {
 	streamCtx, cancel := context.WithTimeout(ctx, streamOpenTimeout)
 	defer cancel()
-	streamCtx = network.WithAllowLimitedConn(streamCtx, "mtunnel:negotiate")
+	streamCtx = network.WithAllowLimitedConn(streamCtx, reasonNegotiate.allowLimited())
 
-	stream, err := h.NewStream(streamCtx, target, NegotiateProtocolID)
+	stream, err := h.NewStream(streamCtx, target, cfg.protocols().Negotiate)
 	if err != nil {
 		return nil, fmt.Errorf("open negotiate stream to %s: %w", target, err)
 	}
-	LogStreamPath("negotiate-opened", stream, cfg.Diagnostic)
+	LogStreamPath(StreamNegotiateOpened, stream, cfg.Diagnostic)
 	return stream, nil
 }

@@ -11,6 +11,8 @@ import (
 	"log"
 	"sync"
 
+	"mtunnel-libp2p/internal/negotiate"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -43,7 +45,13 @@ type Output struct {
 	Port      int       `json:"port,omitempty"`
 	Error     string    `json:"error,omitempty"`
 	// Tier reports the negotiated tunnel data-plane tier on CONNECTED events.
-	Tier string `json:"tier,omitempty"`
+	//
+	// It is negotiate's own type rather than a string: the value is a fixed set of
+	// names, it is produced by tier selection, and typing it here means the one
+	// place it crosses out of the process cannot report a tier that selection could
+	// never have chosen. Both are named string types, so the JSON is unchanged and
+	// the supervisor on the other end sees exactly what it always did.
+	Tier negotiate.Tier `json:"tier,omitempty"`
 }
 
 // Sessions is the subset of session management the control channel drives in

@@ -22,13 +22,16 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 )
 
-// ProtocolID identifies the tunnel stream protocol spoken between host and client.
-const ProtocolID = "/mtunnel/1.0.0"
+// hostRole names which of the two roles a libp2p host was built for. The roles
+// differ in the libp2p services they run - a server takes relay reservations and
+// advertises itself, a client only dials - so the value is a policy input, not
+// just a log label.
+type hostRole string
 
-// NegotiateProtocolID identifies the tier-negotiation stream opened once per
-// session, before any tunnel stream, to agree which data-plane tier carries
-// forwarded traffic (see internal/negotiate).
-const NegotiateProtocolID = "/mtunnel/negotiate/1.0.0"
+const (
+	roleServer hostRole = "server"
+	roleClient hostRole = "client"
+)
 
 // NewServerHost creates the public-facing role. It obtains at most one relay
 // reservation, while retaining hole punching and NAT reachability services.
@@ -49,7 +52,7 @@ func NewServerHost(cfg Config) (host.Host, *metrics.BandwidthCounter, error) {
 	if cfg.ConnectionMode != ConnectionRelayOnly {
 		opts = append(opts, libp2p.EnableHolePunching())
 	}
-	return newHost("server", cfg, opts)
+	return newHost(roleServer, cfg, opts)
 }
 
 func relayCandidates(configured []string) ([]peer.AddrInfo, error) {
@@ -85,10 +88,10 @@ func NewClientHost(cfg Config) (host.Host, *metrics.BandwidthCounter, error) {
 	if cfg.ConnectionMode != ConnectionRelayOnly {
 		opts = append(opts, libp2p.EnableHolePunching())
 	}
-	return newHost("client", cfg, opts)
+	return newHost(roleClient, cfg, opts)
 }
 
-func newHost(role string, cfg Config, opts []libp2p.Option) (host.Host, *metrics.BandwidthCounter, error) {
+func newHost(role hostRole, cfg Config, opts []libp2p.Option) (host.Host, *metrics.BandwidthCounter, error) {
 	bandwidth := metrics.NewBandwidthCounter()
 	opts = append(opts, libp2p.BandwidthReporter(bandwidth))
 

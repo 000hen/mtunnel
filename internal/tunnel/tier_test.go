@@ -16,6 +16,38 @@ import (
 	"mtunnel-libp2p/internal/p2p"
 )
 
+// testTiers builds a data plane the way a live process does, with real credentials
+// and the real registry.
+//
+// The tests go through newTiers rather than assembling a tiers value themselves so
+// that what they exercise is what the binary runs: the advertised tier list comes
+// from the registry, so a tier added to the registry and forgotten in a test's
+// expectations is a failure rather than a silent divergence.
+func testTiers(t *testing.T, opts Options) tiers {
+	t.Helper()
+
+	ts, err := newTiers(opts)
+	if err != nil {
+		t.Fatalf("build tiers: %v", err)
+	}
+	return ts
+}
+
+// testHello builds one side's opening Hello for the given mode, with wgKey standing
+// in for the credential the registry would otherwise generate.
+//
+// The key is overridden rather than read back because these tests care about which
+// key travelled, not which one was generated, and a fixed key is what makes "the
+// client saw the host's key" checkable.
+func testHello(t *testing.T, wgKey [32]byte, mode p2p.TunnelMode, probe bool) negotiate.Hello {
+	t.Helper()
+
+	opts := Options{P2P: p2p.Config{TunnelMode: mode, Diagnostic: probe}}
+	hello := testTiers(t, opts).hello(opts)
+	hello.WireGuardPubKey = wgKey
+	return hello
+}
+
 // connPair returns the two ends of a loopback TCP connection, closed automatically
 // when the test finishes. A real socket, not net.Pipe: the Hello swap is symmetric
 // (both sides send before either receives), which needs a buffered substrate - the
@@ -69,7 +101,7 @@ func TestExchangeHelloTimesOutOnSilentPeer(t *testing.T) {
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
 
 	start := time.Now()
-	_, _, err := exchangeHello(context.Background(), negotiate.NewExchange(conn), localHello([32]byte{}, p2p.TunnelAuto, false, DefaultPunchAttempts), 50*time.Millisecond)
+	_, _, err := exchangeHello(context.Background(), negotiate.NewExchange(conn), testHello(t, [32]byte{}, p2p.TunnelAuto, false), 50*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -99,7 +131,7 @@ func TestProbeAgreed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := probeAgreed(localHello([32]byte{}, p2p.TunnelAuto, tt.local, DefaultPunchAttempts), localHello([32]byte{}, p2p.TunnelAuto, tt.peer, DefaultPunchAttempts))
+			got := probeAgreed(testHello(t, [32]byte{}, p2p.TunnelAuto, tt.local), testHello(t, [32]byte{}, p2p.TunnelAuto, tt.peer))
 			if got != tt.want {
 				t.Errorf("probeAgreed(local=%v, peer=%v) = %v, want %v", tt.local, tt.peer, got, tt.want)
 			}
@@ -674,8 +706,8 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 
 			// Start both sides before awaiting either: neither completes until its
 			// counterpart has sent.
-			clientOut := run(clientConn, localHello([32]byte{}, tt.clientMode, false, DefaultPunchAttempts))
-			hostOut := run(hostConn, localHello(hostKey, tt.hostMode, false, DefaultPunchAttempts))
+			clientOut := run(clientConn, testHello(t, [32]byte{}, tt.clientMode, false))
+			hostOut := run(hostConn, testHello(t, hostKey, tt.hostMode, false))
 			client := <-clientOut
 			host := <-hostOut
 
@@ -695,6 +727,9 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 	}
 }
 
+// TestSupportedTiers pins what each tunnel mode advertises. The expectations name
+// every tier this build implements, so registering a rung without deciding how the
+// modes should treat it fails here rather than shipping unadvertised.
 func TestSupportedTiers(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -714,14 +749,14 @@ func TestSupportedTiers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := supportedTiers(tt.mode)
+			got := testTiers(t, Options{}).supported(tt.mode)
 			if !slices.Equal(got, tt.want) {
-				t.Errorf("supportedTiers(%q) = %v, want %v", tt.mode, got, tt.want)
+				t.Errorf("supported(%q) = %v, want %v", tt.mode, got, tt.want)
 			}
 			// The floor must be last and present whatever the mode: a peer that
 			// supports nothing else still has to resolve to a working tunnel.
 			if got[len(got)-1] != negotiate.TierLibp2p {
-				t.Errorf("supportedTiers(%q) = %v, want the libp2p floor last", tt.mode, got)
+				t.Errorf("supported(%q) = %v, want the libp2p floor last", tt.mode, got)
 			}
 		})
 	}

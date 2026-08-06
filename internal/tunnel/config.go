@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"mtunnel-libp2p/internal/p2p"
+	"mtunnel-libp2p/internal/tier"
 
 	"github.com/libp2p/go-libp2p/core/metrics"
 )
@@ -40,16 +41,6 @@ const (
 	// well as the round trip.
 	punchExchangeTimeout = 20 * time.Second
 
-	// DefaultHandshakeTimeout bounds how long the client waits for a tier above the
-	// floor to prove itself before falling back. WireGuard's Noise-IK is a 1-RTT
-	// exchange over an already-punched path, so a working tier lands in milliseconds;
-	// this is sized to cover one of wireguard-go's own 5s retransmits (RekeyTimeout)
-	// plus slack, so a single dropped initiation costs a retry rather than the tier.
-	//
-	// Exported because it is the -handshake-timeout flag's default, which the CLI
-	// needs to state before it has an Options to ask.
-	DefaultHandshakeTimeout = 6 * time.Second
-
 	// DefaultPunchAttempts is how many times a session punches before settling for the
 	// libp2p relay.
 	//
@@ -68,6 +59,13 @@ const (
 	// state before it has an Options to ask.
 	DefaultPunchAttempts uint8 = 2
 )
+
+// DefaultHandshakeTimeout bounds how long a tier above the floor has to prove
+// itself before the cascade moves on. It is re-exported from internal/tier, where
+// the rungs that spend it live, because it is also the -handshake-timeout flag's
+// default and the CLI needs to state it before it has an Options to ask - and
+// because a second constant with the same job is a second constant to forget.
+const DefaultHandshakeTimeout = tier.DefaultHandshakeTimeout
 
 // Options carries policies selected at the CLI boundary into orchestration.
 type Options struct {
@@ -95,15 +93,7 @@ type Options struct {
 	PunchAttempts uint8
 
 	// HandshakeTimeout bounds each tier's own handshake once the punch has produced
-	// a substrate. Zero means DefaultHandshakeTimeout.
+	// a substrate. Zero means DefaultHandshakeTimeout, resolved by tier.Params rather
+	// than here, so every rung reads the budget from one place.
 	HandshakeTimeout time.Duration
-}
-
-// handshakeTimeout resolves the configured tier-handshake budget, so the ladder
-// reads one value rather than repeating the zero check at every attempt.
-func (o Options) handshakeTimeout() time.Duration {
-	if o.HandshakeTimeout <= 0 {
-		return DefaultHandshakeTimeout
-	}
-	return o.HandshakeTimeout
 }

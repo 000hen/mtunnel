@@ -16,9 +16,21 @@ import (
 
 var processStarted = time.Now()
 
+// StreamEvent names how a tunnel stream came to exist. The three cases are not
+// interchangeable in a diagnostic record: an opened data stream is this side
+// dialing, an accepted one is the peer dialing, and a negotiate stream is neither
+// side's data plane yet.
+type StreamEvent string
+
+const (
+	StreamOpened          StreamEvent = "opened"
+	StreamAccepted        StreamEvent = "accepted"
+	StreamNegotiateOpened StreamEvent = "negotiate-opened"
+)
+
 // LogStreamPath records the immutable libp2p connection selected for a tunnel
 // stream. Existing streams do not migrate when a better connection appears.
-func LogStreamPath(event string, stream network.Stream, enabled bool) {
+func LogStreamPath(event StreamEvent, stream network.Stream, enabled bool) {
 	if !enabled {
 		return
 	}
@@ -28,7 +40,7 @@ func LogStreamPath(event string, stream network.Stream, enabled bool) {
 	local := conn.LocalMultiaddr().String()
 	remote := conn.RemoteMultiaddr().String()
 	slog.Info("tunnel_stream_path",
-		"event", event,
+		"event", string(event),
 		"remote_peer", conn.RemotePeer().String(),
 		"connection_id", conn.ID(),
 		"limited", stat.Limited,

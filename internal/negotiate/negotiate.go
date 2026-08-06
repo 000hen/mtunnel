@@ -32,6 +32,18 @@ const (
 // returns the first tier both sides support.
 var cascade = []Tier{TierWireGuard, TierQUIC, TierLibp2p}
 
+// Cascade returns the fixed priority order, highest first, ending in TierLibp2p.
+//
+// The order is part of the wire contract, not an implementation preference: both
+// sides walk it independently and must reach the same answer without a further
+// round trip, which is what lets tier selection cost no extra message. So it lives
+// here, with the messages, and everything that needs to agree with it - the tier
+// registry in internal/tier, the diagnostic record - reads it from here rather
+// than restating it.
+//
+// The returned slice is a copy; callers may keep or reorder it freely.
+func Cascade() []Tier { return append([]Tier(nil), cascade...) }
+
 // Hello is the first negotiate message, always exchanged. SupportedTiers lists the
 // tiers this side can speak; WireGuardPubKey is this side's static X25519 public key
 // (used only when the resolved tier is WireGuard).

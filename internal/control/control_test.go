@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"mtunnel-libp2p/internal/negotiate"
+
 	"github.com/libp2p/go-libp2p/core/test"
 )
 
@@ -36,7 +38,9 @@ func TestOutputTierRoundTrip(t *testing.T) {
 		SessionId: id,
 		Addr:      "/ip4/127.0.0.1/tcp/1234",
 		Port:      5555,
-		Tier:      "libp2p",
+		// The constant on the way in, the literal on the way out: typing the field
+		// must not change a single byte the supervisor reads.
+		Tier: negotiate.TierLibp2p,
 	}
 
 	var buf bytes.Buffer
@@ -51,8 +55,8 @@ func TestOutputTierRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Tier != "libp2p" {
-		t.Errorf("Tier = %q, want libp2p", got.Tier)
+	if got.Tier != negotiate.TierLibp2p {
+		t.Errorf("Tier = %q, want %q", got.Tier, negotiate.TierLibp2p)
 	}
 	if got.SessionId != id {
 		t.Errorf("SessionId = %s, want %s", got.SessionId, id)

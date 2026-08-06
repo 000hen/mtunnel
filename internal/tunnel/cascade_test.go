@@ -12,6 +12,7 @@ import (
 
 	"mtunnel-libp2p/internal/nat"
 	"mtunnel-libp2p/internal/negotiate"
+	"mtunnel-libp2p/internal/tier"
 	"mtunnel-libp2p/internal/transport"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -135,8 +136,10 @@ func fixedAgent(substrate net.Conn, tag string) punchFactory {
 
 // cascadeHostResult is what the host half of a ladder run ended on.
 type cascadeHostResult struct {
-	// rung is the tier the host stood up, if one got that far.
-	rung hostRung
+	// served names the tier the host stood up, and rung is what it stood up, if one
+	// got that far.
+	served negotiate.Tier
+	rung   tier.Rung
 	// floor records the client giving up on every rung and naming the libp2p floor.
 	floor bool
 	// requested is every rung the client asked for, in order, the libp2p floor included.
@@ -152,10 +155,10 @@ type cascadeHostResult struct {
 // serveUpperTiers implements, and every tier-building call is the production one.
 //
 // refuse names the rungs it acknowledges and then does not stand up. That is not a
-// contrived failure: it is exactly what a host whose standUpRung returned an error
+// contrived failure: it is exactly what a host whose Set.Serve returned an error
 // does, and it signals nothing back, because the client is running the same rung on
 // the same substrate and finds out for itself.
-func serveCascadeCounterpart(ctx context.Context, x *negotiate.Exchange, opts Options, ids tierIdentities, peerHello negotiate.Hello, substrate net.Conn, t transport.Transport, refuse ...negotiate.Tier) cascadeHostResult {
+func serveCascadeCounterpart(ctx context.Context, x *negotiate.Exchange, opts Options, ts tiers, peerHello negotiate.Hello, substrate net.Conn, t transport.Transport, refuse ...negotiate.Tier) cascadeHostResult {
 	var res cascadeHostResult
 
 	// next records what the client asked for before returning it. The record is the only
@@ -171,13 +174,13 @@ func serveCascadeCounterpart(ctx context.Context, x *negotiate.Exchange, opts Op
 	}
 
 	attempts := negotiate.EffectivePunchAttempts(punchAttemptsFor(opts), peerHello.PunchAttempts)
-	punched, err := punch(ctx, x, opts, false, "cascade-client", ids.quic.Fingerprint, attempts, fixedAgent(substrate, "host"))
+	punched, err := punch(ctx, x, opts, false, "cascade-client", ts.ids.QUICFingerprint(), attempts, fixedAgent(substrate, "host"))
 	if err != nil {
 		res.err = fmt.Errorf("host punch: %w", err)
 		return res
 	}
 
-	deps := hostTierDeps{transport: t}
+	session := tierSession(t.Network(), peerHello, punched)
 	pending, err := next()
 	for err == nil {
 		if pending.Tier == negotiate.TierLibp2p {
@@ -191,12 +194,12 @@ func serveCascadeCounterpart(ctx context.Context, x *negotiate.Exchange, opts Op
 			pending, err = next()
 			continue
 		}
-		rung, outcome, standErr := standUpRung(ctx, pending.Tier, punched, opts, ids, peerHello, deps)
+		rung, outcome, standErr := ts.set.Serve(ctx, pending.Tier, punched.conn, session)
 		if standErr != nil {
 			res.err = fmt.Errorf("stand up %s (%s): %w", pending.Tier, outcome, standErr)
 			return res
 		}
-		res.rung = rung
+		res.served, res.rung = pending.Tier, rung
 		return res
 	}
 	res.err = err
@@ -208,22 +211,27 @@ type cascadeRun struct {
 	client tierResult
 	host   cascadeHostResult
 	err    error
+	// tiers is the client's registry, kept so a test can ask it the same question
+	// serveRung asks in production - whether an error means the substrate is gone -
+	// rather than matching on a sentinel the tunnel package is not supposed to know.
+	tiers tiers
 }
 
 // runCascade wires a client and a host onto one negotiate stream and one substrate
 // pair, and runs the ladder to whatever it settles on. Both halves run concurrently
 // because they have to: the acknowledgement each rung waits for comes from the other
 // side, and the QUIC rung's Accept does not return until the client dials it.
-func runCascade(t *testing.T, shape substrateShape, network string, refuse ...negotiate.Tier) cascadeRun {
+func runCascade(t *testing.T, shape substrateShape, network transport.Network, refuse ...negotiate.Tier) cascadeRun {
 	t.Helper()
 
-	clientIDs, err := newTierIdentities()
+	opts := Options{HandshakeTimeout: cascadeHandshakeTimeout}
+	clientTiers, err := newTiers(opts)
 	if err != nil {
-		t.Fatalf("client identities: %v", err)
+		t.Fatalf("client tiers: %v", err)
 	}
-	hostIDs, err := newTierIdentities()
+	hostTiers, err := newTiers(opts)
 	if err != nil {
-		t.Fatalf("host identities: %v", err)
+		t.Fatalf("host tiers: %v", err)
 	}
 
 	forwarder, err := transportFor(network, false)
@@ -234,24 +242,23 @@ func runCascade(t *testing.T, shape substrateShape, network string, refuse ...ne
 	clientSignal, hostSignal := connPair(t)
 	clientSub, hostSub := substratePair(t, shape)
 
-	opts := Options{HandshakeTimeout: cascadeHandshakeTimeout}
 	cascade := []negotiate.Tier{negotiate.TierWireGuard, negotiate.TierQUIC, negotiate.TierLibp2p}
-	clientHello := negotiate.Hello{SupportedTiers: cascade, WireGuardPubKey: clientIDs.wg.public}
-	hostHello := negotiate.Hello{SupportedTiers: cascade, WireGuardPubKey: hostIDs.wg.public}
+	clientHello := negotiate.Hello{SupportedTiers: cascade, WireGuardPubKey: clientTiers.ids.WireGuardPublicKey()}
+	hostHello := negotiate.Hello{SupportedTiers: cascade, WireGuardPubKey: hostTiers.ids.WireGuardPublicKey()}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cascadeDeadline)
 	defer cancel()
 
 	served := make(chan cascadeHostResult, 1)
 	go func() {
-		served <- serveCascadeCounterpart(ctx, negotiate.NewExchange(hostSignal), opts, hostIDs, clientHello, hostSub, forwarder, refuse...)
+		served <- serveCascadeCounterpart(ctx, negotiate.NewExchange(hostSignal), opts, hostTiers, clientHello, hostSub, forwarder, refuse...)
 	}()
 
 	result, clientErr := climbCascade(
 		ctx,
 		negotiate.NewExchange(clientSignal),
 		opts,
-		clientIDs,
+		clientTiers,
 		hostHello,
 		peer.ID("cascade-host"),
 		forwarder.Network(),
@@ -269,10 +276,10 @@ func runCascade(t *testing.T, shape substrateShape, network string, refuse ...ne
 	if clientErr == nil {
 		t.Cleanup(func() { _ = result.close() })
 	}
-	if host.rung.close != nil {
-		t.Cleanup(func() { _ = host.rung.close() })
+	if host.rung.Close != nil {
+		t.Cleanup(func() { _ = host.rung.Close() })
 	}
-	return cascadeRun{client: result, host: host, err: clientErr}
+	return cascadeRun{client: result, host: host, err: clientErr, tiers: clientTiers}
 }
 
 // TestCascadeFallsBackFromWireGuardToQUIC is the test M4 exists for. The client tries
@@ -301,23 +308,23 @@ func TestCascadeFallsBackFromWireGuardToQUIC(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			run := runCascade(t, tc.shape, "tcp", negotiate.TierWireGuard)
+			run := runCascade(t, tc.shape, transport.NetworkTCP, negotiate.TierWireGuard)
 			if run.err != nil {
 				t.Fatalf("climbCascade: %v (host: %+v)", run.err, run.host)
 			}
 			if run.host.err != nil {
 				t.Fatalf("host half: %v", run.host.err)
 			}
-			if run.client.tier != negotiate.TierQUIC {
-				t.Fatalf("client settled on tier %q, want %q", run.client.tier, negotiate.TierQUIC)
+			if run.client.selected != negotiate.TierQUIC {
+				t.Fatalf("client settled on tier %q, want %q", run.client.selected, negotiate.TierQUIC)
 			}
-			if run.host.rung.tier != negotiate.TierQUIC {
-				t.Fatalf("host stood up tier %q, want %q", run.host.rung.tier, negotiate.TierQUIC)
+			if run.host.served != negotiate.TierQUIC {
+				t.Fatalf("host stood up tier %q, want %q", run.host.served, negotiate.TierQUIC)
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), cascadeDeadline)
 			defer cancel()
-			echoThrough(t, ctx, run.client.opener, run.host.rung.accept)
+			echoThrough(t, ctx, run.client.opener, run.host.rung.Acceptor)
 		})
 	}
 }
@@ -329,9 +336,9 @@ func TestCascadeFallsBackFromWireGuardToQUIC(t *testing.T) {
 func TestCascadeExhaustsEveryRung(t *testing.T) {
 	t.Parallel()
 
-	run := runCascade(t, punchedSubstrate, "tcp", negotiate.TierWireGuard, negotiate.TierQUIC)
+	run := runCascade(t, punchedSubstrate, transport.NetworkTCP, negotiate.TierWireGuard, negotiate.TierQUIC)
 	if run.err == nil {
-		t.Fatalf("climbCascade unexpectedly succeeded on tier %q", run.client.tier)
+		t.Fatalf("climbCascade unexpectedly succeeded on tier %q", run.client.selected)
 	}
 	if run.host.err != nil {
 		t.Fatalf("host half: %v", run.host.err)
@@ -362,11 +369,11 @@ func TestCascadeExhaustsEveryRung(t *testing.T) {
 func TestCascadeStopsWhenTheSubstrateIsAbandoned(t *testing.T) {
 	t.Parallel()
 
-	run := runCascade(t, stubDeadlineSubstrate, "tcp", negotiate.TierWireGuard)
+	run := runCascade(t, stubDeadlineSubstrate, transport.NetworkTCP, negotiate.TierWireGuard)
 	if run.err == nil {
-		t.Fatalf("climbCascade unexpectedly succeeded on tier %q", run.client.tier)
+		t.Fatalf("climbCascade unexpectedly succeeded on tier %q", run.client.selected)
 	}
-	if !substrateAbandoned(run.err) {
+	if !run.tiers.set.SubstrateAbandoned(run.err) {
 		t.Errorf("climbCascade error = %v, want one reporting an abandoned substrate", run.err)
 	}
 	if run.host.err != nil {
@@ -392,26 +399,26 @@ func TestCascadeStopsWhenTheSubstrateIsAbandoned(t *testing.T) {
 func TestCascadeCarriesForwardedUDP(t *testing.T) {
 	t.Parallel()
 
-	run := runCascade(t, punchedSubstrate, "udp", negotiate.TierWireGuard)
+	run := runCascade(t, punchedSubstrate, transport.NetworkUDP, negotiate.TierWireGuard)
 	if run.err != nil {
 		t.Fatalf("climbCascade: %v (host: %+v)", run.err, run.host)
 	}
 	if run.host.err != nil {
 		t.Fatalf("host half: %v", run.host.err)
 	}
-	if run.client.tier != negotiate.TierQUIC {
-		t.Fatalf("client settled on tier %q, want %q", run.client.tier, negotiate.TierQUIC)
+	if run.client.selected != negotiate.TierQUIC {
+		t.Fatalf("client settled on tier %q, want %q", run.client.selected, negotiate.TierQUIC)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cascadeDeadline)
 	defer cancel()
-	echoThrough(t, ctx, run.client.opener, run.host.rung.accept)
+	echoThrough(t, ctx, run.client.opener, run.host.rung.Acceptor)
 }
 
 // echoThrough opens one forwarded connection over the winning tier and bounces a
 // payload off the host end of it, which is the only evidence that the tier is
 // actually carrying traffic rather than merely built.
-func echoThrough(t *testing.T, ctx context.Context, opener transport.Opener, acceptor streamAcceptor) {
+func echoThrough(t *testing.T, ctx context.Context, opener transport.Opener, acceptor tier.Acceptor) {
 	t.Helper()
 
 	const payload = "cascade round trip"

@@ -314,8 +314,20 @@ func (m *UDPMux) Close() error {
 // that closes twice must not be told the substrate survived because someone else asked
 // first. Bind.Close has already run by the time device.Close returns, since it happens
 // inside the state transition device.Close performs before it returns.
+//
+// Down before Close is not redundant. device.Close closes the TUN first and stops the
+// peers second, so a peer's sequential receiver can still be delivering a decrypted
+// packet into netstack while netTun.Close closes the channel it delivers on - a send on
+// a closed channel, which is a panic in shutdown rather than a report only the race
+// detector would see. Down stops the peers and waits for exactly those goroutines, so
+// by the time Close touches the TUN nothing is writing to it. Down on a device that
+// never came up is a no-op, and the second BindClose inside Close finds a bind that is
+// already closed, so neither costs anything.
 func (t *Tunnel) Close() error {
-	t.closeOnce.Do(t.dev.Close)
+	t.closeOnce.Do(func() {
+		_ = t.dev.Down()
+		t.dev.Close()
+	})
 	if t.bind.Abandoned() {
 		return ErrSubstrateAbandoned
 	}

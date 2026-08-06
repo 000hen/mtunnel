@@ -31,9 +31,9 @@ type Opener interface {
 // implementation exists per supported network type; the orchestration selects it
 // once and then drives TCP and UDP through the same code.
 type Transport interface {
-	// Network is the canonical network name ("tcp" or "udp"), used both to dial
-	// the host's local service and to label the connection token.
-	Network() string
+	// Network is the network this transport forwards, used both to dial the
+	// host's local service and to label the connection token.
+	Network() Network
 
 	// Forward bridges a tunnel stream and the host's local connection in both
 	// directions until either side ends. TCP copies raw bytes; UDP preserves

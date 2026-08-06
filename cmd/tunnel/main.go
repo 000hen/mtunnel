@@ -17,6 +17,7 @@ import (
 	"mtunnel-libp2p/internal/control"
 	"mtunnel-libp2p/internal/nat"
 	"mtunnel-libp2p/internal/p2p"
+	"mtunnel-libp2p/internal/transport"
 	"mtunnel-libp2p/internal/tunnel"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -25,7 +26,7 @@ import (
 
 func main() {
 	port := flag.Int("port", 0, "Port to forward, in client mode this is the local port to connect to")
-	network := flag.String("network", "tcp", "Network type for the forwarded connection: tcp or udp")
+	networkFlag := flag.String("network", "tcp", "Network type for the forwarded connection: tcp or udp")
 	token := flag.String("token", "", "Connection token for client mode")
 	diagnostic := flag.Bool("diagnostic", false, "Emit structured path, resource, and data-flow diagnostics")
 	connectionModeFlag := flag.String("connection-mode", "direct-first", "Stream policy: direct-only, direct-first, or relay-only")
@@ -44,7 +45,14 @@ func main() {
 
 	emitter := control.NewEmitter(os.Stdout)
 
-	if err := tunnel.NetworkSupported(*network); err != nil {
+	// Two checks, because they answer different questions: ParseNetwork validates the
+	// spelling and turns the flag into the typed value everything downstream passes
+	// around, and NetworkSupported asks whether this build has a forwarder for it.
+	network, err := transport.ParseNetwork(*networkFlag)
+	if err != nil {
+		log.Fatalf("Invalid network type: %v", err)
+	}
+	if err := tunnel.NetworkSupported(network); err != nil {
 		log.Fatalf("Invalid network type: %v", err)
 	}
 
@@ -143,7 +151,7 @@ func main() {
 		slog.Info("test_configuration",
 			"commit_sha", buildRevision(),
 			"role", role,
-			"network", *network,
+			"network", string(network),
 			"connection_mode", connectionMode,
 			"transport", transportMode,
 			"dht_mode", dhtMode,
@@ -159,7 +167,7 @@ func main() {
 		)
 	}
 	if *token == "" {
-		err = tunnel.RunHost(ctx, h, emitter, *network, *port, opts)
+		err = tunnel.RunHost(ctx, h, emitter, network, *port, opts)
 	} else {
 		err = tunnel.RunClient(ctx, h, emitter, *token, *port, opts)
 	}

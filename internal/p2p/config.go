@@ -99,4 +99,23 @@ type Config struct {
 	DirectDialTimeout time.Duration
 	Diagnostic        bool
 	RelayAddrs        []string
+
+	// Protocols is the generation of tunnel protocol IDs this side speaks. The
+	// host serves its own (CurrentProtocols); the client resolves the host's from
+	// the token version it was given, so which channel a stream opens on is
+	// derived from the token rather than assumed at each call site.
+	//
+	// The zero value means CurrentProtocols, so a Config built before a token has
+	// been decoded - which is every Config the CLI builds - is already correct for
+	// the host role and for anything that does not dial.
+	Protocols Protocols
+}
+
+// protocols resolves the configured protocol generation, so the stream helpers
+// read one value rather than repeating the zero check at each call site.
+func (c Config) protocols() Protocols {
+	if c.Protocols.Data == "" || c.Protocols.Negotiate == "" {
+		return CurrentProtocols()
+	}
+	return c.Protocols
 }
