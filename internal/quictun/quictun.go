@@ -124,7 +124,8 @@ type Tunnel struct {
 
 	// mux is set in the datagram sub-mode only, and carries every forwarded flow over
 	// the connection's single datagram channel.
-	mux *flowmux.Mux
+	mux      *flowmux.Mux
+	datagram *datagramCodec
 
 	closeOnce sync.Once
 	closeErr  error
@@ -271,6 +272,9 @@ func (t *Tunnel) Done() <-chan struct{} { return t.conn.Context().Done() }
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(func() {
 		_ = t.conn.CloseWithError(closeCode, "tunnel closed")
+		if t.datagram != nil {
+			t.datagram.Close()
+		}
 		if t.mux != nil {
 			_ = t.mux.Close()
 			// The mux's receive loop wakes on the connection's context, which

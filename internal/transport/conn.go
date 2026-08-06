@@ -14,6 +14,16 @@ type ConnStream struct {
 	net.Conn
 }
 
+// CloseWrite half-closes the underlying connection when it supports it.
+// Plain net.Conn has no half-close operation, so closing is the best available
+// equivalent for transports without a write side to close independently.
+func (c ConnStream) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
 var _ Stream = ConnStream{}
 
 // Reset closes the connection; see the type comment for why the distinction

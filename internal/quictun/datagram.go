@@ -17,9 +17,10 @@ import (
 
 // newMux builds the flow multiplexer over this connection's datagram channel.
 func (t *Tunnel) newMux(dialing bool) *flowmux.Mux {
+	t.datagram = newDatagramCodec(t.conn.SendDatagram, t.recvDatagram)
 	return flowmux.New(flowmux.Config{
-		Send:    t.conn.SendDatagram,
-		Recv:    t.recvDatagram,
+		Send:    t.datagram.Send,
+		Recv:    t.datagram.Recv,
 		Dialing: dialing,
 		OnDrop:  t.logFlowDrop,
 	})

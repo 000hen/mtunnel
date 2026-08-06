@@ -27,6 +27,7 @@ type channel struct {
 	mu      sync.Mutex
 	sendErr error
 	sent    [][]byte
+	drop    func([]byte) bool
 }
 
 func newChannelPair() (*channel, *channel) {
@@ -48,7 +49,11 @@ func (c *channel) send(msg []byte) error {
 	// violation of that contract show up as a test failure rather than as luck.
 	cp := append([]byte(nil), msg...)
 	c.sent = append(c.sent, cp)
+	drop := c.drop
 	c.mu.Unlock()
+	if drop != nil && drop(cp) {
+		return nil
+	}
 
 	select {
 	case c.peer <- cp:
@@ -56,6 +61,12 @@ func (c *channel) send(msg []byte) error {
 	case <-c.closed:
 		return net.ErrClosed
 	}
+}
+
+func (c *channel) setDrop(drop func([]byte) bool) {
+	c.mu.Lock()
+	c.drop = drop
+	c.mu.Unlock()
 }
 
 func (c *channel) recv() ([]byte, error) {
@@ -615,5 +626,205 @@ func TestMuxRejectsFlowInLocalNamespace(t *testing.T) {
 	}
 	if id := binary.BigEndian.Uint32(sent[0][:Header]); id != 0 {
 		t.Fatalf("OpenStream used flow ID %d, want 0", id)
+	}
+}
+
+func controlFrame(id uint32, kind frameKind) []byte {
+	frame := make([]byte, Header)
+	binary.BigEndian.PutUint32(frame[:4], id)
+	frame[4] = byte(kind)
+	return frame
+}
+
+func dataFrame(id uint32, payload []byte) []byte {
+	frame := controlFrame(id, frameData)
+	return append(frame, payload...)
+}
+
+func testReliableConfig(c *channel, dialing bool) Config {
+	return Config{
+		Send:             c.send,
+		Recv:             c.recv,
+		Dialing:          dialing,
+		FINRetryInterval: time.Hour,
+		FINRetryCount:    2,
+		IdleTimeout:      time.Hour,
+		TombstoneTTL:     time.Hour,
+	}
+}
+
+func TestMuxRetriesLostFIN(t *testing.T) {
+	dialChan, acceptChan := newChannelPair()
+	dialer := New(testReliableConfig(dialChan, true))
+	accepter := New(testReliableConfig(acceptChan, false))
+	t.Cleanup(func() {
+		close(dialChan.closed)
+		_ = dialer.Close()
+		_ = accepter.Close()
+	})
+
+	dialChan.setDrop(func(frame []byte) bool {
+		return len(frame) == Header && frame[4] == byte(frameFIN)
+	})
+
+	local, err := dialer.OpenStream(context.Background())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	remote, fresh := accepter.lookupOrCreate(0)
+	if remote == nil || !fresh {
+		t.Fatal("create peer flow")
+	}
+	if err := local.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	dialer.maintenance(time.Now().Add(2 * time.Hour))
+	if got := len(dialChan.messages()); got != 2 {
+		t.Fatalf("FIN sends = %d, want initial send plus one retry", got)
+	}
+	accepter.handle(controlFrame(0, frameFIN))
+	if _, err := remote.recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("remote after retried FIN = %v, want io.EOF", err)
+	}
+}
+
+func TestFlowCloseReportsInitialFINSendError(t *testing.T) {
+	t.Parallel()
+
+	want := errors.New("send FIN")
+	releaseRecv := make(chan struct{})
+	mux := New(Config{
+		Dialing: true,
+		Send: func([]byte) error {
+			return want
+		},
+		Recv: func() ([]byte, error) {
+			<-releaseRecv
+			return nil, net.ErrClosed
+		},
+	})
+
+	stream, err := mux.OpenStream(t.Context())
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	if err := stream.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close() error = %v, want %v", err, want)
+	}
+
+	close(releaseRecv)
+	<-mux.Done()
+}
+
+func TestMuxDuplicateFINRetriesUntilACK(t *testing.T) {
+	dialChan, acceptChan := newChannelPair()
+	dialer := New(testReliableConfig(dialChan, true))
+	accepter := New(testReliableConfig(acceptChan, false))
+	t.Cleanup(func() {
+		close(dialChan.closed)
+		_ = dialer.Close()
+		_ = accepter.Close()
+	})
+
+	acceptChan.setDrop(func(frame []byte) bool {
+		return len(frame) == Header && frame[4] == byte(frameFINAck)
+	})
+	dialChan.setDrop(func(frame []byte) bool {
+		return len(frame) == Header && frame[4] == byte(frameFIN)
+	})
+
+	local, err := dialer.OpenStream(context.Background())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	remote, _ := accepter.lookupOrCreate(0)
+	if err := local.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	accepter.handle(controlFrame(0, frameFIN))
+	if _, err := remote.recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("remote after initial FIN = %v, want io.EOF", err)
+	}
+
+	dialer.maintenance(time.Now().Add(2 * time.Hour))
+	accepter.handle(controlFrame(0, frameFIN))
+	dialer.handle(controlFrame(0, frameFINAck))
+	dialer.mu.Lock()
+	_, pending := dialer.pending[0]
+	dialer.mu.Unlock()
+	if pending {
+		t.Fatal("duplicate FIN ACK did not clear pending teardown")
+	}
+}
+
+func TestMuxFINTombstoneDropsLateData(t *testing.T) {
+	dialChan, acceptChan := newChannelPair()
+	accepter := New(testReliableConfig(acceptChan, false))
+	t.Cleanup(func() {
+		close(dialChan.closed)
+		_ = accepter.Close()
+	})
+
+	accepter.handle(controlFrame(42, frameFIN))
+	accepter.handle(dataFrame(42, []byte("late")))
+
+	accepter.mu.Lock()
+	_, live := accepter.flows[42]
+	_, tombstoned := accepter.tombstones[42]
+	accepter.mu.Unlock()
+	if live || !tombstoned {
+		t.Fatalf("late DATA after FIN: live=%v tombstoned=%v", live, tombstoned)
+	}
+}
+
+func TestMuxIdleReapsWhenAllFINsAreLost(t *testing.T) {
+	dialChan, acceptChan := newChannelPair()
+	dialChan.setDrop(func(frame []byte) bool {
+		return len(frame) == Header && frame[4] == byte(frameFIN)
+	})
+	dialer := New(testReliableConfig(dialChan, true))
+	accepter := New(testReliableConfig(acceptChan, false))
+	t.Cleanup(func() {
+		close(dialChan.closed)
+		_ = dialer.Close()
+		_ = accepter.Close()
+	})
+
+	local, err := dialer.OpenStream(context.Background())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	remote, _ := accepter.lookupOrCreate(0)
+	then := time.Now().Add(2 * time.Hour)
+	dialer.maintenance(then)
+	accepter.maintenance(then)
+	if _, err := local.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("local after idle reap = %v, want net.ErrClosed", err)
+	}
+	if _, err := remote.recv(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("remote after idle reap = %v, want net.ErrClosed", err)
+	}
+
+	accepter.handle(dataFrame(0, []byte("late")))
+	accepter.mu.Lock()
+	_, resurrected := accepter.flows[0]
+	_, tombstoned := accepter.tombstones[0]
+	accepter.mu.Unlock()
+	if resurrected || !tombstoned {
+		t.Fatalf("late DATA after idle reap: live=%v tombstoned=%v", resurrected, tombstoned)
+	}
+}
+
+func TestMuxCloseStopsMaintenance(t *testing.T) {
+	dialChan, _ := newChannelPair()
+	mux := New(testReliableConfig(dialChan, true))
+	close(dialChan.closed)
+	if err := mux.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-mux.maintDone:
+	default:
+		t.Fatal("Close returned before the maintenance loop stopped")
 	}
 }

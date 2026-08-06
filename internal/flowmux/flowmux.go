@@ -7,13 +7,12 @@
 // and many forwarded UDP flows to carry over it, so the flow has to be named in the
 // message itself:
 //
-//	+----------------+------------------------------------------+
-//	| flow ID (4 B)  | payload                                  |
-//	+----------------+------------------------------------------+
+//	+----------------+------+-----------------------------------+
+//	| flow ID (4 B)  | kind | payload                           |
+//	+----------------+------+-----------------------------------+
 //
-// An empty payload is a FIN for that flow. That sentinel is safe because internal/udp's
-// framing always writes at least its own 2-byte length prefix, so an empty payload can
-// never be application data and needs no flag bit of its own.
+// DATA carries a forwarded datagram. FIN and FIN_ACK are retried control frames: the
+// channel is deliberately unreliable, so a one-shot close would leak the peer's flow.
 //
 // The alternative - one reliable stream per flow - is what the TCP sub-modes do, and
 // is rejected here for the reason these tiers exist: a retransmitted stale game packet
@@ -30,13 +29,14 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"mtunnel-libp2p/internal/transport"
 )
 
 const (
-	// Header is the size of the flow ID prefix each message carries.
-	Header = 4
+	// Header is the size of the flow ID and kind prefix each message carries.
+	Header = 5
 
 	// inboundBacklog is how many peer-initiated flows may wait to be accepted.
 	inboundBacklog = 64
@@ -46,6 +46,21 @@ const (
 	// every flow, so making it wait on the slowest one would stall them all, and
 	// dropping under overload is what the forwarded protocol already tolerates.
 	flowQueue = 64
+
+	defaultFINRetryInterval = time.Second
+	defaultFINRetryCount    = 3
+	defaultIdleTimeout      = 2 * time.Minute
+	defaultTombstoneTTL     = time.Minute
+	defaultMaxPending       = 1024
+	defaultMaxTombstones    = 1024
+)
+
+type frameKind byte
+
+const (
+	frameData frameKind = iota
+	frameFIN
+	frameFINAck
 )
 
 // Config is what a Mux needs from the channel it runs on.
@@ -71,6 +86,20 @@ type Config struct {
 	// how a silently dropped connection becomes visible rather than looking identical
 	// to one that never arrived.
 	OnDrop func(id uint32, reason string)
+
+	// FINRetryInterval and FINRetryCount bound reliable flow teardown. Zero values use
+	// conservative defaults. FINRetryCount is the number of retransmissions after the
+	// initial FIN.
+	FINRetryInterval time.Duration
+	FINRetryCount    int
+
+	// IdleTimeout releases a flow if every FIN was lost. Zero uses a conservative
+	// default. TombstoneTTL keeps a recently closed peer flow from being resurrected by
+	// late DATA; MaxPending and MaxTombstones bound control-plane memory.
+	IdleTimeout   time.Duration
+	TombstoneTTL  time.Duration
+	MaxPending    int
+	MaxTombstones int
 }
 
 // A Mux carries many transport.Streams over one message channel. It satisfies
@@ -78,17 +107,28 @@ type Config struct {
 type Mux struct {
 	cfg Config
 
-	mu     sync.Mutex
-	flows  map[uint32]*flow
-	next   uint32
-	closed bool
+	mu         sync.Mutex
+	flows      map[uint32]*flow
+	pending    map[uint32]*pendingFIN
+	tombstones map[uint32]time.Time
+	next       uint32
+	closed     bool
+	sendMu     sync.Mutex
 
 	inbound chan *flow
 
 	recvDone chan struct{}
 	recvErr  error
 
+	maintStop chan struct{}
+	maintDone chan struct{}
+	stopOnce  sync.Once
 	closeOnce sync.Once
+}
+
+type pendingFIN struct {
+	next    time.Time
+	retries int
 }
 
 var _ transport.Opener = (*Mux)(nil)
@@ -106,13 +146,18 @@ func New(cfg Config) *Mux {
 	}
 
 	m := &Mux{
-		cfg:      cfg,
-		flows:    make(map[uint32]*flow),
-		next:     first,
-		inbound:  make(chan *flow, inboundBacklog),
-		recvDone: make(chan struct{}),
+		cfg:        cfg,
+		flows:      make(map[uint32]*flow),
+		pending:    make(map[uint32]*pendingFIN),
+		tombstones: make(map[uint32]time.Time),
+		next:       first,
+		inbound:    make(chan *flow, inboundBacklog),
+		recvDone:   make(chan struct{}),
+		maintStop:  make(chan struct{}),
+		maintDone:  make(chan struct{}),
 	}
 	go m.receive()
+	go m.maintain()
 	return m
 }
 
@@ -164,9 +209,13 @@ func (m *Mux) Done() <-chan struct{} { return m.recvDone }
 //
 // The receive loop is not waited for here: it can only be unblocked by the channel
 // failing, which is the tier's job to arrange, and blocking on it would make Close
-// depend on a peer that may already be gone.
+// depend on a peer that may already be gone. The maintenance loop is ours, so Close
+// does stop and wait for it.
 func (m *Mux) Close() error {
-	m.closeOnce.Do(func() { m.shutAll(net.ErrClosed) })
+	m.closeOnce.Do(func() {
+		m.stopMaintenance()
+		m.shutAll(net.ErrClosed)
+	})
 	return nil
 }
 
@@ -178,6 +227,7 @@ func (m *Mux) receive() {
 		msg, err := m.cfg.Recv()
 		if err != nil {
 			m.recvErr = err
+			m.stopMaintenance()
 			m.shutAll(err)
 			return
 		}
@@ -187,48 +237,83 @@ func (m *Mux) receive() {
 			// but drop it.
 			continue
 		}
-
-		id := binary.BigEndian.Uint32(msg[:Header])
-		payload := msg[Header:]
-
-		if len(payload) == 0 {
-			// A FIN. If the flow is already gone this is a stray for one both sides have
-			// finished with - ignoring it is what stops it from being mistaken for the
-			// start of a new flow.
-			if f := m.take(id); f != nil {
-				f.shut(io.EOF)
-			}
-			continue
-		}
-
-		f, fresh := m.lookupOrCreate(id)
-		if f == nil {
-			if m.stopped() {
-				return // closed underneath us
-			}
-			// The peer named an ID this side allocates and there is no such flow, so
-			// there is nothing to deliver to - see lookupOrCreate. Report it: a message
-			// that names an impossible flow is a peer bug or a stale frame, and both
-			// are worth seeing rather than silently discarding.
-			if m.cfg.OnDrop != nil {
-				m.cfg.OnDrop(id, "flow ID in local namespace")
-			}
-			continue
-		}
-		if fresh {
-			select {
-			case m.inbound <- f:
-			default:
-				// The backlog is full, which means nothing is accepting.
-				m.remove(f)
-				if m.cfg.OnDrop != nil {
-					m.cfg.OnDrop(id, "accept backlog full")
-				}
-				continue
-			}
-		}
-		f.deliver(payload)
+		m.handle(msg)
 	}
+}
+
+// handle sorts one complete channel message into its flow. It is kept separate from
+// receive so the wire-state transitions can be tested without timer or scheduler
+// races.
+func (m *Mux) handle(msg []byte) {
+	if len(msg) < Header {
+		return
+	}
+
+	id := binary.BigEndian.Uint32(msg[:4])
+	kind := frameKind(msg[4])
+	payload := msg[Header:]
+
+	switch kind {
+	case frameFIN:
+		if len(payload) != 0 {
+			return
+		}
+		f := m.takeAndTombstone(id)
+		if f != nil {
+			f.shut(io.EOF)
+		}
+		_ = m.sendControl(id, frameFINAck)
+		return
+	case frameFINAck:
+		if len(payload) == 0 {
+			m.acknowledgeFIN(id)
+		}
+		return
+	case frameData:
+		if len(payload) == 0 {
+			return
+		}
+	default:
+		return
+	}
+
+	f, fresh := m.lookupOrCreate(id)
+	if f == nil {
+		if m.stopped() {
+			return // closed underneath us
+		}
+		if m.tombstoned(id) {
+			return // late DATA for a flow a FIN already closed
+		}
+		// The peer named an ID this side allocates and there is no such flow, so
+		// there is nothing to deliver to - see lookupOrCreate. Report it: a message
+		// that names an impossible flow is a peer bug or a stale frame, and both
+		// are worth seeing rather than silently discarding.
+		if m.cfg.OnDrop != nil {
+			m.cfg.OnDrop(id, "flow ID in local namespace")
+		}
+		return
+	}
+	if fresh {
+		select {
+		case m.inbound <- f:
+		default:
+			// The backlog is full, which means nothing is accepting.
+			m.remove(f)
+			if m.cfg.OnDrop != nil {
+				m.cfg.OnDrop(id, "accept backlog full")
+			}
+			return
+		}
+	}
+	f.deliver(payload)
+}
+
+func (m *Mux) tombstoned(id uint32) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.tombstones[id]
+	return ok
 }
 
 // lookupOrCreate returns the flow for an inbound message, creating it if the peer has
@@ -253,6 +338,9 @@ func (m *Mux) lookupOrCreate(id uint32) (f *flow, fresh bool) {
 	}
 	if f, ok := m.flows[id]; ok {
 		return f, false
+	}
+	if _, closed := m.tombstones[id]; closed {
+		return nil, false
 	}
 	if (id&1 == 0) == m.cfg.Dialing {
 		return nil, false
@@ -284,6 +372,44 @@ func (m *Mux) take(id uint32) *flow {
 	return f
 }
 
+// takeAndTombstone prevents a FIN that overtakes DATA from allowing the late data to
+// create a new peer flow. The table is deliberately bounded because the peer controls
+// the IDs it sends us.
+func (m *Mux) takeAndTombstone(id uint32) *flow {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.addTombstoneLocked(id, time.Now().Add(m.tombstoneTTL()))
+	f := m.flows[id]
+	delete(m.flows, id)
+	return f
+}
+
+func (m *Mux) acknowledgeFIN(id uint32) {
+	m.mu.Lock()
+	delete(m.pending, id)
+	m.mu.Unlock()
+}
+
+func (m *Mux) beginFIN(id uint32) error {
+	m.mu.Lock()
+	if !m.closed && len(m.pending) < m.maxPending() {
+		m.pending[id] = &pendingFIN{next: time.Now().Add(m.finRetryInterval())}
+	}
+	m.mu.Unlock()
+	return m.sendControl(id, frameFIN)
+}
+
+func (m *Mux) addTombstoneLocked(id uint32, until time.Time) {
+	if _, exists := m.tombstones[id]; !exists && len(m.tombstones) >= m.maxTombstones() {
+		for evict := range m.tombstones {
+			delete(m.tombstones, evict)
+			break
+		}
+	}
+	m.tombstones[id] = until
+}
+
 // remove evicts f only if f is still the flow registered under its ID.
 //
 // The identity check is the same guard internal/udp's flow table documents: a flow
@@ -309,6 +435,8 @@ func (m *Mux) shutAll(cause error) {
 		live = append(live, f)
 	}
 	m.flows = make(map[uint32]*flow)
+	m.pending = make(map[uint32]*pendingFIN)
+	m.tombstones = make(map[uint32]time.Time)
 	m.mu.Unlock()
 
 	// Outside the lock: shut only touches the flow's own state, but a closer that
@@ -316,6 +444,137 @@ func (m *Mux) shutAll(cause error) {
 	for _, f := range live {
 		f.shut(cause)
 	}
+}
+
+func (m *Mux) stopMaintenance() {
+	m.stopOnce.Do(func() {
+		close(m.maintStop)
+		<-m.maintDone
+	})
+}
+
+func (m *Mux) maintain() {
+	interval := m.finRetryInterval()
+	if idle := m.idleTimeout() / 2; idle > 0 && idle < interval {
+		interval = idle
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer close(m.maintDone)
+
+	for {
+		select {
+		case <-m.maintStop:
+			return
+		case now := <-ticker.C:
+			m.maintenance(now)
+		}
+	}
+}
+
+func (m *Mux) maintenance(now time.Time) {
+	var (
+		retry []uint32
+		idle  []*flow
+	)
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	for id, until := range m.tombstones {
+		if !now.Before(until) {
+			delete(m.tombstones, id)
+		}
+	}
+	for id, pending := range m.pending {
+		if !now.Before(pending.next) {
+			if pending.retries >= m.finRetryCount() {
+				delete(m.pending, id)
+				continue
+			}
+			pending.retries++
+			pending.next = now.Add(m.finRetryInterval())
+			retry = append(retry, id)
+		}
+	}
+	for id, f := range m.flows {
+		if now.Sub(f.lastActivity) >= m.idleTimeout() {
+			delete(m.flows, id)
+			// Idle reaping is the last-resort close path when every FIN was lost.
+			// Keep the same late-DATA guard as an observed FIN; otherwise a packet
+			// delayed past the idle deadline could immediately recreate the peer flow.
+			m.addTombstoneLocked(id, now.Add(m.tombstoneTTL()))
+			idle = append(idle, f)
+			if len(m.pending) < m.maxPending() {
+				m.pending[id] = &pendingFIN{next: now.Add(m.finRetryInterval())}
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for _, f := range idle {
+		f.shut(net.ErrClosed)
+		_ = m.sendControl(f.id, frameFIN)
+	}
+	for _, id := range retry {
+		_ = m.sendControl(id, frameFIN)
+	}
+}
+
+func (m *Mux) sendControl(id uint32, kind frameKind) error {
+	var frame [Header]byte
+	binary.BigEndian.PutUint32(frame[:4], id)
+	frame[4] = byte(kind)
+	return m.sendFrame(frame[:])
+}
+
+func (m *Mux) sendFrame(frame []byte) error {
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	return m.cfg.Send(frame)
+}
+
+func (m *Mux) finRetryInterval() time.Duration {
+	if m.cfg.FINRetryInterval > 0 {
+		return m.cfg.FINRetryInterval
+	}
+	return defaultFINRetryInterval
+}
+
+func (m *Mux) finRetryCount() int {
+	if m.cfg.FINRetryCount > 0 {
+		return m.cfg.FINRetryCount
+	}
+	return defaultFINRetryCount
+}
+
+func (m *Mux) idleTimeout() time.Duration {
+	if m.cfg.IdleTimeout > 0 {
+		return m.cfg.IdleTimeout
+	}
+	return defaultIdleTimeout
+}
+
+func (m *Mux) tombstoneTTL() time.Duration {
+	if m.cfg.TombstoneTTL > 0 {
+		return m.cfg.TombstoneTTL
+	}
+	return defaultTombstoneTTL
+}
+
+func (m *Mux) maxPending() int {
+	if m.cfg.MaxPending > 0 {
+		return m.cfg.MaxPending
+	}
+	return defaultMaxPending
+}
+
+func (m *Mux) maxTombstones() int {
+	if m.cfg.MaxTombstones > 0 {
+		return m.cfg.MaxTombstones
+	}
+	return defaultMaxTombstones
 }
 
 // flow is one forwarded connection multiplexed over the shared channel.
@@ -329,14 +588,17 @@ type flow struct {
 	once   sync.Once
 	closed chan struct{}
 	err    error
+
+	lastActivity time.Time
 }
 
 func newFlow(id uint32, m *Mux) *flow {
 	return &flow{
-		id:      id,
-		mux:     m,
-		packets: make(chan []byte, flowQueue),
-		closed:  make(chan struct{}),
+		id:           id,
+		mux:          m,
+		packets:      make(chan []byte, flowQueue),
+		closed:       make(chan struct{}),
+		lastActivity: time.Now(),
 	}
 }
 
@@ -358,6 +620,7 @@ func (f *flow) shut(cause error) {
 // never blocks: one receive loop serves every flow, so waiting on one would stall
 // them all.
 func (f *flow) deliver(payload []byte) {
+	f.mux.touch(f)
 	select {
 	case f.packets <- payload:
 	default:
@@ -396,6 +659,7 @@ func (f *flow) send(payload []byte) error {
 	// concurrent Writes on one flow would otherwise interleave into the same bytes.
 	bufp := framePool.Get().(*[]byte)
 	frame := binary.BigEndian.AppendUint32((*bufp)[:0], f.id)
+	frame = append(frame, byte(frameData))
 	frame = append(frame, payload...)
 
 	// A message the channel cannot carry - a QUIC datagram over the path limit, say -
@@ -403,7 +667,7 @@ func (f *flow) send(payload []byte) error {
 	// a forwarded datagram the application never sent, and dropping it silently would
 	// look like packet loss the peer could not diagnose; failing the flow is the only
 	// option that stays honest about what happened.
-	err := f.mux.cfg.Send(frame)
+	err := f.mux.sendFrame(frame)
 
 	// Returned whatever happened, and only after Send has returned: Config.Send is
 	// documented not to retain the slice, which is precisely what makes reuse legal
@@ -415,7 +679,16 @@ func (f *flow) send(payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("flowmux: send on flow %d: %w", f.id, err)
 	}
+	f.mux.touch(f)
 	return nil
+}
+
+func (m *Mux) touch(f *flow) {
+	m.mu.Lock()
+	if current, ok := m.flows[f.id]; ok && current == f {
+		f.lastActivity = time.Now()
+	}
+	m.mu.Unlock()
 }
 
 // framePool holds frame buffers for send. The initial capacity covers a header plus a
@@ -446,8 +719,5 @@ func (f *flow) close() error {
 
 	f.mux.remove(f)
 
-	var fin [Header]byte
-	binary.BigEndian.PutUint32(fin[:], f.id)
-	_ = f.mux.cfg.Send(fin[:])
-	return nil
+	return f.mux.beginFIN(f.id)
 }

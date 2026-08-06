@@ -4,17 +4,24 @@
 //
 // Like internal/transport it is a leaf package: it imports only the standard
 // library and has no libp2p dependency, so the tier-selection logic stays
-// unit-testable and network-agnostic. The wire format is gob, matching the
-// connection token (internal/p2p/token.go) - both are exchanged between two
-// instances of this exact binary, unlike the external JSON control channel.
+// unit-testable and network-agnostic. The wire format is fixed binary frames,
+// unlike the external JSON control channel.
 package negotiate
 
 import (
 	"context"
-	"encoding/gob"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
+
+// MaxMessageSize bounds one negotiate message. The exchange runs over a stream
+// opened by a remote peer, so every frame and field is checked before allocation.
+const MaxMessageSize = 256 << 10
+
+// ErrMessageTooLarge reports a negotiate frame larger than MaxMessageSize.
+var ErrMessageTooLarge = errors.New("negotiate message too large")
 
 // Tier names a tunnel data-plane protocol. The cascade priority is fixed:
 // WireGuard is preferred over QUIC, which is preferred over the libp2p floor.
@@ -51,15 +58,19 @@ type Hello struct {
 	SupportedTiers  []Tier
 	WireGuardPubKey [32]byte
 
+	// RequiredTier pins this session to an upper tier. An empty value preserves the
+	// normal cascade; a non-empty value means both sides must use that tier and may
+	// not silently fall through to libp2p when it cannot be established.
+	RequiredTier Tier
+
 	// PunchProbe asks for a measurement-only NAT punch after tier selection: both
 	// sides exchange PunchInfo and attempt an ICE connection purely to record the
 	// outcome, then discard it. It exists because the punch has to be proven against
 	// real NATs before any tier depends on it.
 	//
 	// The probe runs only when both sides set this, which is what keeps the stream in
-	// lockstep. That also makes it safe against a peer predating the field: gob
-	// decodes the absent field as false, so the newer side skips the extra phase the
-	// older side would never reach.
+	// lockstep. Protocol-generation compatibility is handled before this stream is
+	// opened, so peers on this generation always exchange the same bounded shape.
 	PunchProbe bool
 
 	// PunchAttempts is how many times this side is willing to punch before giving up
@@ -70,9 +81,7 @@ type Hello struct {
 	// The effective count is PunchAttempts(min) of the two sides, via EffectivePunchAttempts,
 	// for the same reason PunchProbe is an AND: the two sides walk this loop in lockstep
 	// and a side that gave up early would leave the other reading a message type its
-	// peer will never send. Zero means one attempt, which is both the natural floor and
-	// what a peer predating the field decodes to - pinning that pairing to today's
-	// behaviour.
+	// peer will never send. Zero means one attempt, preserving a safe natural floor.
 	PunchAttempts uint8
 }
 
@@ -91,8 +100,7 @@ type PunchOutcome struct {
 }
 
 // EffectivePunchAttempts resolves how many punch attempts the two sides will make. It
-// is the smaller of the two requests, with zero - the value gob produces for a peer that
-// predates the field - meaning one.
+// is the smaller of the two requests, with zero meaning one.
 //
 // Both sides call it with the same pair of numbers and so reach the same answer without
 // a further round trip, exactly as SharedCascade does for tiers.
@@ -133,6 +141,36 @@ type PunchInfo struct {
 // its libp2p handler already being live.
 type Attempt struct {
 	Tier Tier
+
+	// Commit distinguishes selecting a rung to try from committing its lifetime after
+	// both sides have brought it up. The host acknowledges both transitions.
+	Commit bool
+}
+
+// RequiredCascade resolves the shared cascade and any forced-tier policy carried
+// by the two Hellos. It is symmetric so both peers reach the same answer without a
+// further round trip.
+func RequiredCascade(local, peer Hello) ([]Tier, error) {
+	required := local.RequiredTier
+	if required == "" {
+		required = peer.RequiredTier
+	} else if peer.RequiredTier != "" && peer.RequiredTier != required {
+		return nil, fmt.Errorf("required tiers disagree: %q and %q", required, peer.RequiredTier)
+	}
+	if required == "" {
+		return SharedCascade(local.SupportedTiers, peer.SupportedTiers), nil
+	}
+	if required == TierLibp2p || !knownTier(required) || !toSet(local.SupportedTiers)[required] || !toSet(peer.SupportedTiers)[required] {
+		return nil, fmt.Errorf("required tier %q is not mutually supported", required)
+	}
+	return []Tier{required}, nil
+}
+
+// TierRequired reports whether either side prohibited fallback to the libp2p
+// floor. Callers use it to turn a failed upper-tier attempt into a negotiation
+// error even when their own mode is auto.
+func TierRequired(local, peer Hello) bool {
+	return local.RequiredTier != "" || peer.RequiredTier != ""
 }
 
 // SharedCascade returns every tier both sides support, in descending priority. It is
@@ -178,12 +216,18 @@ func toSet(tiers []Tier) map[Tier]bool {
 	return set
 }
 
-// An Exchange carries every negotiate phase over one stream. Both phases must share
-// a single encoder/decoder pair: gob.NewDecoder wraps a reader that is not an
-// io.ByteReader (a libp2p stream is not) in a bufio.Reader, so a decoder built fresh
-// per phase would discard bytes the previous decoder had already buffered - the
-// second phase would then read garbage or hang. Holding the pair for the stream's
-// lifetime avoids that entirely.
+func knownTier(t Tier) bool {
+	for _, candidate := range cascade {
+		if candidate == t {
+			return true
+		}
+	}
+	return false
+}
+
+// An Exchange carries every negotiate phase over one stream. Each fixed-format
+// message is put in its own length-prefixed frame, so decoding is bounded and cannot
+// consume bytes belonging to the next message.
 //
 // Every phase is symmetric: both sides send before either receives, so the stream
 // underneath must buffer a whole message without a concurrent read. Real streams do
@@ -194,15 +238,14 @@ func toSet(tiers []Tier) map[Tier]bool {
 // An Exchange is not safe for concurrent use, and must not be reused after a call
 // returns a context error: the abandoned encode/decode may still be in flight.
 type Exchange struct {
-	enc *gob.Encoder
-	dec *gob.Decoder
+	rw io.ReadWriter
 }
 
 // NewExchange binds an Exchange to rw. The caller retains ownership of rw and is
 // responsible for closing it, which is also what unblocks an in-flight phase when
 // its context is cancelled.
 func NewExchange(rw io.ReadWriter) *Exchange {
-	return &Exchange{enc: gob.NewEncoder(rw), dec: gob.NewDecoder(rw)}
+	return &Exchange{rw: rw}
 }
 
 // Negotiate exchanges Hello messages and returns the resolved tier and the peer's
@@ -213,7 +256,11 @@ func (x *Exchange) Negotiate(ctx context.Context, local Hello) (Tier, Hello, err
 	if err != nil {
 		return "", Hello{}, err
 	}
-	return SelectTier(local.SupportedTiers, peer.SupportedTiers), peer, nil
+	cascade, err := RequiredCascade(local, peer)
+	if err != nil {
+		return "", Hello{}, err
+	}
+	return cascade[0], peer, nil
 }
 
 // ExchangePunchInfo swaps PunchInfo messages, mirroring Negotiate's symmetric
@@ -250,7 +297,7 @@ func (x *Exchange) ReceiveAttempt(ctx context.Context) (Attempt, error) {
 func send[T any](ctx context.Context, x *Exchange, local T, what string) error {
 	done := make(chan error, 1)
 	go func() {
-		if err := x.enc.Encode(local); err != nil {
+		if err := x.encode(local); err != nil {
 			done <- fmt.Errorf("send %s: %w", what, err)
 			return
 		}
@@ -275,7 +322,7 @@ func receive[T any](ctx context.Context, x *Exchange, what string) (T, error) {
 	done := make(chan result, 1)
 	go func() {
 		var msg T
-		if err := x.dec.Decode(&msg); err != nil {
+		if err := x.decode(&msg); err != nil {
 			done <- result{err: fmt.Errorf("receive %s: %w", what, err)}
 			return
 		}
@@ -305,12 +352,12 @@ func swap[T any](ctx context.Context, x *Exchange, local T, what string) (T, err
 	}
 	done := make(chan result, 1)
 	go func() {
-		if err := x.enc.Encode(local); err != nil {
+		if err := x.encode(local); err != nil {
 			done <- result{err: fmt.Errorf("send %s: %w", what, err)}
 			return
 		}
 		var peer T
-		if err := x.dec.Decode(&peer); err != nil {
+		if err := x.decode(&peer); err != nil {
 			done <- result{err: fmt.Errorf("receive %s: %w", what, err)}
 			return
 		}
@@ -326,4 +373,51 @@ func swap[T any](ctx context.Context, x *Exchange, local T, what string) (T, err
 		}
 		return res.peer, nil
 	}
+}
+
+func (x *Exchange) encode(msg any) error {
+	payload, err := marshalMessage(msg)
+	if err != nil {
+		return err
+	}
+	if len(payload) > MaxMessageSize {
+		return fmt.Errorf("%w: %d bytes", ErrMessageTooLarge, len(payload))
+	}
+
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if err := writeAll(x.rw, header[:]); err != nil {
+		return err
+	}
+	return writeAll(x.rw, payload)
+}
+
+func (x *Exchange) decode(msg any) error {
+	var header [4]byte
+	if _, err := io.ReadFull(x.rw, header[:]); err != nil {
+		return err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size > MaxMessageSize {
+		return fmt.Errorf("%w: %d bytes", ErrMessageTooLarge, size)
+	}
+	payload := make([]byte, size)
+	if _, err := io.ReadFull(x.rw, payload); err != nil {
+		return err
+	}
+	return unmarshalMessage(payload, msg)
+}
+
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
 }

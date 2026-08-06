@@ -3,7 +3,7 @@ package negotiate
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -177,6 +177,32 @@ func TestSharedCascade(t *testing.T) {
 	}
 }
 
+func TestRequiredCascade(t *testing.T) {
+	t.Parallel()
+
+	auto := Hello{SupportedTiers: []Tier{TierWireGuard, TierQUIC, TierLibp2p}}
+	forcedWireGuard := Hello{SupportedTiers: []Tier{TierWireGuard, TierLibp2p}, RequiredTier: TierWireGuard}
+	forcedQUIC := Hello{SupportedTiers: []Tier{TierQUIC, TierLibp2p}, RequiredTier: TierQUIC}
+
+	cascade, err := RequiredCascade(auto, forcedWireGuard)
+	if err != nil {
+		t.Fatalf("RequiredCascade(auto, forced) = %v", err)
+	}
+	if want := []Tier{TierWireGuard}; !reflect.DeepEqual(cascade, want) {
+		t.Fatalf("RequiredCascade(auto, forced) = %v, want %v", cascade, want)
+	}
+	if !TierRequired(auto, forcedWireGuard) {
+		t.Fatal("TierRequired(auto, forced) = false, want true")
+	}
+
+	if _, err := RequiredCascade(forcedWireGuard, forcedQUIC); err == nil {
+		t.Fatal("RequiredCascade(disagreeing forced tiers) succeeded")
+	}
+	if _, err := RequiredCascade(Hello{SupportedTiers: []Tier{TierLibp2p}, RequiredTier: TierWireGuard}, auto); err == nil {
+		t.Fatal("RequiredCascade(unsupported required tier) succeeded")
+	}
+}
+
 func TestEffectivePunchAttempts(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -186,10 +212,8 @@ func TestEffectivePunchAttempts(t *testing.T) {
 		want  uint8
 	}{
 		{
-			// The case that keeps a mixed-version pairing working. gob decodes an absent
-			// field as zero, so a peer built before PunchAttempts existed advertises 0 -
-			// and 0 has to mean the one attempt that peer will actually make, not "no
-			// attempts" and not "as many as I like".
+			// Zero preserves the natural one-attempt floor rather than meaning no
+			// attempt or an unbounded number of retries.
 			name:  "an absent peer field pins both sides to one attempt",
 			local: 4,
 			peer:  0,
@@ -314,7 +338,7 @@ func TestExchangeAttempt(t *testing.T) {
 
 	// The client walks the ladder and announces each rung as it reaches it, ending on
 	// the floor when the punched substrate has nothing left to offer.
-	sent := []Attempt{{Tier: TierWireGuard}, {Tier: TierQUIC}, {Tier: TierLibp2p}}
+	sent := []Attempt{{Tier: TierWireGuard}, {Tier: TierWireGuard, Commit: true}, {Tier: TierQUIC}, {Tier: TierLibp2p}}
 	errs := make(chan error, 1)
 	go func() {
 		for _, a := range sent {
@@ -355,7 +379,72 @@ func TestReceiveAttemptHonoursContext(t *testing.T) {
 	}
 }
 
-func TestHelloGobRoundTrip(t *testing.T) {
+func TestReceiveAttemptRejectsOversizeFrame(t *testing.T) {
+	t.Parallel()
+
+	var wire bytes.Buffer
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], MaxMessageSize+1)
+	if _, err := wire.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewExchange(&wire).ReceiveAttempt(context.Background())
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("ReceiveAttempt error = %v, want ErrMessageTooLarge", err)
+	}
+}
+
+func TestReceiveAttemptRejectsMalformedFrame(t *testing.T) {
+	t.Parallel()
+
+	var wire bytes.Buffer
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], 2)
+	_, _ = wire.Write(header[:])
+	_, _ = wire.Write([]byte{codecVersion, 2}) // Commit must be 0 or 1.
+
+	_, err := NewExchange(&wire).ReceiveAttempt(context.Background())
+	if !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ReceiveAttempt error = %v, want ErrInvalidMessage", err)
+	}
+}
+
+func TestFixedMessageCodecsRejectMalformedPayloads(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data []byte
+		into any
+	}{
+		{name: "attempt trailing bytes", data: []byte{codecVersion, 0, 0, 0, 0}, into: &Attempt{}},
+		{name: "outcome invalid boolean", data: []byte{codecVersion, 2}, into: &PunchOutcome{}},
+		{name: "outcome trailing bytes", data: []byte{codecVersion, 1, 0}, into: &PunchOutcome{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := unmarshalMessage(tt.data, tt.into); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("unmarshalMessage(%x) = %v, want ErrInvalidMessage", tt.data, err)
+			}
+		})
+	}
+}
+
+func TestSendAttemptRejectsOversizedTier(t *testing.T) {
+	t.Parallel()
+
+	var wire bytes.Buffer
+	err := NewExchange(&wire).SendAttempt(context.Background(), Attempt{Tier: Tier(string(make([]byte, MaxMessageSize)))})
+	if !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("SendAttempt error = %v, want ErrInvalidMessage", err)
+	}
+	if wire.Len() != 0 {
+		t.Fatalf("SendAttempt wrote %d bytes for an oversized message", wire.Len())
+	}
+}
+
+func TestHelloCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	want := Hello{
 		SupportedTiers:  []Tier{TierWireGuard, TierLibp2p},
@@ -363,71 +452,91 @@ func TestHelloGobRoundTrip(t *testing.T) {
 		PunchProbe:      true,
 	}
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(want); err != nil {
-		t.Fatalf("encode: %v", err)
+	payload, err := marshalHello(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
 	var got Hello
-	if err := gob.NewDecoder(&buf).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
+	if err := unmarshalHello(payload, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, want)
 	}
 }
 
-// TestHelloDecodesPeerWithoutPunchProbe pins the compatibility property the punch
-// probe relies on: a peer built before PunchProbe existed sends a Hello without it,
-// and the newer side must read that as "no probe" rather than erroring. If this ever
-// broke, the two sides would disagree about how many messages the stream carries and
-// the exchange would desynchronise instead of degrading.
-func TestHelloDecodesPeerWithoutPunchProbe(t *testing.T) {
+func TestHelloCodecRejectsMalformedLengths(t *testing.T) {
 	t.Parallel()
-	// The Hello shape before PunchProbe was added. gob matches fields by name and
-	// ignores the Go type's own name, so this encodes exactly what an older peer does.
-	type helloWithoutProbe struct {
-		SupportedTiers  []Tier
-		WireGuardPubKey [32]byte
-	}
 
-	var buf bytes.Buffer
-	sent := helloWithoutProbe{SupportedTiers: []Tier{TierLibp2p}, WireGuardPubKey: [32]byte{0xAB}}
-	if err := gob.NewEncoder(&buf).Encode(sent); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-
-	var got Hello
-	if err := gob.NewDecoder(&buf).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got.PunchProbe {
-		t.Error("PunchProbe = true for a peer that never sent the field, want false")
-	}
-	if !reflect.DeepEqual(got.SupportedTiers, sent.SupportedTiers) || got.WireGuardPubKey != sent.WireGuardPubKey {
-		t.Fatalf("decoded %+v, want the sent fields %+v", got, sent)
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		// A tiny payload must not cause a slice allocation based on this count.
+		{name: "huge tier count", data: []byte{codecVersion, 0xFF}},
+		{name: "oversized tier name", data: []byte{codecVersion, 1, 0xFF, 0xFF}},
+		{name: "trailing bytes", data: append(validHelloPayload(t), 0x01)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got Hello
+			if err := unmarshalHello(tt.data, &got); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("unmarshalHello(%x) = %v, want ErrInvalidMessage", tt.data, err)
+			}
+		})
 	}
 }
 
-func TestPunchInfoGobRoundTrip(t *testing.T) {
+func TestPunchInfoCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	want := PunchInfo{
 		ICEUfrag:            "ufrag",
 		ICEPwd:              "password",
 		ICECandidates:       []string{"candidate:1 1 udp ...", "candidate:2 1 udp ..."},
-		QUICCertFingerprint: []byte{0xDE, 0xAD, 0xBE, 0xEF},
+		QUICCertFingerprint: append([]byte{0xDE, 0xAD, 0xBE, 0xEF}, make([]byte, 28)...),
 	}
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(want); err != nil {
-		t.Fatalf("encode: %v", err)
+	payload, err := marshalPunchInfo(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
 	var got PunchInfo
-	if err := gob.NewDecoder(&buf).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
+	if err := unmarshalPunchInfo(payload, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, want)
 	}
+}
+
+func TestPunchInfoCodecRejectsMalformedLengths(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		// The count is checked before make([]string, count), so this six-byte input
+		// cannot turn into a large allocation.
+		{name: "huge candidate count", data: []byte{codecVersion, 0, 0, 0, 0, 0xFF}},
+		{name: "oversized candidate", data: []byte{codecVersion, 0, 0, 0, 0, 1, 0xFF, 0xFF}},
+		{name: "invalid fingerprint length", data: []byte{codecVersion, 0, 0, 0, 0, 0, 1, 0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got PunchInfo
+			if err := unmarshalPunchInfo(tt.data, &got); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("unmarshalPunchInfo(%x) = %v, want ErrInvalidMessage", tt.data, err)
+			}
+		})
+	}
+}
+
+func validHelloPayload(t *testing.T) []byte {
+	t.Helper()
+	p, err := marshalHello(Hello{SupportedTiers: []Tier{TierLibp2p}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // TestNegotiateExchange drives a full duplex exchange between two independent
@@ -481,8 +590,7 @@ func TestNegotiateExchange(t *testing.T) {
 // TestExchangeBothPhases runs Hello and then PunchInfo over a single Exchange, which
 // is how the real two-phase handshake uses one stream. It is the regression test for
 // sharing one encoder/decoder pair: with a decoder built fresh per phase, the
-// bufio.Reader gob wraps around the stream swallows the head of the second message
-// and this test hangs or decodes garbage.
+// fixed frame decoder cannot consume the head of the second message.
 func TestExchangeBothPhases(t *testing.T) {
 	t.Parallel()
 	aConn, bConn := connPair(t)
@@ -490,7 +598,7 @@ func TestExchangeBothPhases(t *testing.T) {
 	aHello := Hello{SupportedTiers: []Tier{TierWireGuard, TierLibp2p}, WireGuardPubKey: [32]byte{0xAA}}
 	bHello := Hello{SupportedTiers: []Tier{TierWireGuard, TierQUIC, TierLibp2p}, WireGuardPubKey: [32]byte{0xBB}}
 	aInfo := PunchInfo{ICEUfrag: "aaaa", ICEPwd: "apwd", ICECandidates: []string{"a-cand"}}
-	bInfo := PunchInfo{ICEUfrag: "bbbb", ICEPwd: "bpwd", ICECandidates: []string{"b-cand"}, QUICCertFingerprint: []byte{0x01, 0x02}}
+	bInfo := PunchInfo{ICEUfrag: "bbbb", ICEPwd: "bpwd", ICECandidates: []string{"b-cand"}, QUICCertFingerprint: append([]byte{0x01, 0x02}, make([]byte, 30)...)}
 
 	type outcome struct {
 		tier      Tier

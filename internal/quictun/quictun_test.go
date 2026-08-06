@@ -222,7 +222,7 @@ func TestTunnelDatagramFlowRoundTrip(t *testing.T) {
 			return
 		}
 		defer s.Close()
-		buf := make([]byte, 2048)
+		buf := make([]byte, maxDatagramMessage)
 		for range 3 {
 			n, err := s.Read(buf)
 			if err != nil {
@@ -243,9 +243,9 @@ func TestTunnelDatagramFlowRoundTrip(t *testing.T) {
 	}
 	defer s.Close()
 
-	buf := make([]byte, 2048)
-	for i := range 3 {
-		want := bytes.Repeat([]byte{byte('A' + i)}, 200+i)
+	buf := make([]byte, maxDatagramMessage)
+	for i, size := range []int{200, 2048, maxUDPDatagram} {
+		want := bytes.Repeat([]byte{byte('A' + i)}, size)
 		if _, err := s.Write(want); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}

@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // tiers is this process's data plane: the registry of rungs it can build, and the
@@ -33,6 +34,12 @@ type tiers struct {
 	set *tier.Set
 	ids tier.Identities
 }
+
+// errRungCommit marks an uncertain lifetime handoff. Falling to the floor after
+// this error is unsafe: the host may already have committed the upper rung even if
+// its acknowledgement was lost. The client must end the session so peer-level
+// disconnect tears either possible host state down.
+var errRungCommit = errors.New("tunnel rung commit failed")
 
 // newTiers generates this run's tier credentials and builds the registry over them.
 //
@@ -59,10 +66,10 @@ func newTiers(opts Options) (tiers, error) {
 //
 // What is advertised is what this build actually implements - the registry, not a
 // list restated here - so a tier that exists on the wire but not in this binary is
-// never offered. Forcing narrows the list but does not remove the floor, which is
-// what keeps tier selection a pure intersection with no special cases. What forcing
-// actually changes is the response to failure: see climbCascade (hard failure) and
-// RunHost (no libp2p data handler registered at all).
+// never offered. Forcing narrows the list but does not remove the floor. RequiredTier
+// separately carries the no-fallback policy so an auto peer cannot mistake that floor
+// for an allowed result. See climbCascade and RunHost for the matching hard-failure
+// behavior.
 func (t tiers) supported(mode p2p.TunnelMode) []negotiate.Tier {
 	if forced, ok := forcedTier(mode); ok {
 		if _, ok := t.set.Lookup(forced); ok {
@@ -82,9 +89,11 @@ func (t tiers) supported(mode p2p.TunnelMode) []negotiate.Tier {
 // produce diagnostic records - a session that negotiates a tier above the floor
 // punches for real instead, and never runs the probe.
 func (t tiers) hello(opts Options) negotiate.Hello {
+	required, _ := forcedTier(opts.P2P.TunnelMode)
 	return negotiate.Hello{
 		SupportedTiers:  t.supported(opts.P2P.TunnelMode),
 		WireGuardPubKey: t.ids.WireGuardPublicKey(),
+		RequiredTier:    required,
 		PunchProbe:      opts.P2P.Diagnostic,
 		PunchAttempts:   punchAttemptsFor(opts),
 	}
@@ -178,13 +187,10 @@ func exchangeHello(ctx context.Context, x *negotiate.Exchange, local negotiate.H
 // negotiateTierClient opens a negotiate stream to target, runs the tier handshake,
 // and climbs the fallback cascade to whatever data plane will actually carry traffic.
 //
-// In auto mode it never fails the session: any error - a peer that predates the
-// negotiate protocol, a failed punch, a WireGuard handshake that never lands, a QUIC
-// handshake after it - resolves to the libp2p floor, which is exactly the behaviour
-// that existed before tier negotiation. Failing hard would turn an optional upgrade
-// into a new way for a working tunnel to break. Under a forced -tunnel-mode it does
-// the opposite and returns the error, because the whole point of forcing a tier is to
-// find out whether it works rather than to be quietly rescued.
+// Negotiation setup is mandatory for protocol generation 2: without the peer Hello,
+// an auto client cannot know whether the host requires an upper tier. Once Hello has
+// completed, auto mode may still fall back after a failed optional rung; forced mode
+// instead returns that failure.
 //
 // tokenWGPubKey is the host key the client already learned from the token; the Hello
 // copy is authoritative and a disagreement is only logged. network is the forwarded
@@ -203,11 +209,7 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 
 	stream, err := p2p.OpenNegotiateStream(ctx, h, target, opts.P2P)
 	if err != nil {
-		if forced {
-			return libp2pFloor(), fmt.Errorf("open negotiate stream to %s: %w", target, err)
-		}
-		log.Printf("Tier negotiation with %s unavailable, using %s tier: %v", target, negotiate.TierLibp2p, err)
-		return libp2pFloor(), nil
+		return libp2pFloor(), fmt.Errorf("open negotiate stream to %s: %w", target, err)
 	}
 
 	local := ts.hello(opts)
@@ -215,11 +217,7 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 	selected, peerHello, err := exchangeHello(ctx, exchange, local, negotiateTimeout)
 	if err != nil {
 		_ = stream.Reset()
-		if forced {
-			return libp2pFloor(), fmt.Errorf("negotiate tunnel tier with %s: %w", target, err)
-		}
-		log.Printf("Tier negotiation with %s failed, using %s tier: %v", target, negotiate.TierLibp2p, err)
-		return libp2pFloor(), nil
+		return libp2pFloor(), fmt.Errorf("negotiate tunnel tier with %s: %w", target, err)
 	}
 	if tokenWGPubKey != ([32]byte{}) && peerHello.WireGuardPubKey != tokenWGPubKey {
 		// Not fatal - the negotiated key wins - but a mismatch means the token was
@@ -229,7 +227,12 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 	}
 	logTierNegotiated(opts.P2P, local, peerHello, selected)
 
-	cascade := negotiate.SharedCascade(local.SupportedTiers, peerHello.SupportedTiers)
+	cascade, err := negotiate.RequiredCascade(local, peerHello)
+	if err != nil {
+		_ = stream.Reset()
+		return libp2pFloor(), fmt.Errorf("resolve tunnel tier with %s: %w", target, err)
+	}
+	required := negotiate.TierRequired(local, peerHello)
 
 	// Both sides compute the same cascade and the same probeAgreed from the same pair
 	// of Hellos, so both take the same branch here. That is what keeps the stream in
@@ -239,16 +242,20 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 	case cascade[0] != negotiate.TierLibp2p:
 		result, err := climbCascade(ctx, exchange, opts, ts, peerHello, target, network, cascade, newPunchAgent)
 		if err == nil {
-			// The negotiate stream is the tier's lifeline: the host tears its half down
-			// when the stream ends, so it stays open as long as the tunnel does.
-			result.close = tier.CloseAll(result.close, stream.Close)
+			// A successful commit transfers lifetime ownership to the tier itself. The
+			// negotiate stream is only setup signalling and may close while libp2p cycles
+			// relay and direct connections.
+			_ = stream.Close()
 			return result, nil
 		}
 		// Reset rather than close. climbCascade has already told the host it is falling
 		// to the floor where it could; where it could not, the exchange is in an unknown
 		// state and only a reset reliably releases the host's reader.
 		_ = stream.Reset()
-		if forced {
+		if errors.Is(err, errRungCommit) {
+			return libp2pFloor(), fmt.Errorf("commit tunnel tier with %s: %w", target, err)
+		}
+		if forced || required {
 			return libp2pFloor(), fmt.Errorf("tunnel mode %s forced but unavailable: %w", opts.P2P.TunnelMode, err)
 		}
 		log.Printf("No tunnel tier above the floor came up with %s, using %s tier: %v", target, negotiate.TierLibp2p, err)
@@ -264,7 +271,7 @@ func negotiateTierClient(ctx context.Context, h host.Host, target peer.ID, opts 
 
 	default:
 		_ = stream.Close()
-		if forced {
+		if forced || required {
 			return libp2pFloor(), fmt.Errorf("tunnel mode %s forced but host %s does not support it", opts.P2P.TunnelMode, target)
 		}
 		return libp2pFloor(), nil
@@ -327,6 +334,11 @@ func climbCascade(ctx context.Context, x *negotiate.Exchange, opts Options, ts t
 			}
 			continue
 		}
+		if err := commitRung(ctx, x, id); err != nil {
+			_ = rung.Close()
+			_ = punched.agent.Close()
+			return tierResult{}, fmt.Errorf("%w for %s: %v", errRungCommit, id, err)
+		}
 		logTierAttempt(opts, id, outcome, time.Since(rungStart), nil)
 		return tierResult{
 			selected: id,
@@ -338,12 +350,13 @@ func climbCascade(ctx context.Context, x *negotiate.Exchange, opts Options, ts t
 		}, nil
 	}
 
-	// Every rung failed. Tell the host so it stops standing tiers up and releases the
-	// substrate on its side too; the floor needs no acknowledgement, since the libp2p
-	// data handler it falls back to is already live.
-	fallbackCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
-	_ = x.SendAttempt(fallbackCtx, negotiate.Attempt{Tier: negotiate.TierLibp2p})
-	cancel()
+	// A peer that requires an upper tier must fail the negotiation together instead
+	// of claiming a libp2p floor its host deliberately did not register.
+	if !negotiate.TierRequired(negotiate.Hello{RequiredTier: forcedTierFor(opts.P2P.TunnelMode)}, peerHello) {
+		fallbackCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
+		_ = x.SendAttempt(fallbackCtx, negotiate.Attempt{Tier: negotiate.TierLibp2p})
+		cancel()
+	}
 	_ = punched.agent.Close()
 
 	if lastErr == nil {
@@ -372,10 +385,31 @@ func requestRung(ctx context.Context, x *negotiate.Exchange, id negotiate.Tier) 
 	if err != nil {
 		return err
 	}
-	if ack.Tier != id {
+	if ack.Tier != id || ack.Commit {
 		return fmt.Errorf("host acknowledged tier %q for a %q attempt", ack.Tier, id)
 	}
 	return nil
+}
+
+func commitRung(ctx context.Context, x *negotiate.Exchange, id negotiate.Tier) error {
+	ctx, cancel := context.WithTimeout(ctx, negotiateTimeout)
+	defer cancel()
+	if err := x.SendAttempt(ctx, negotiate.Attempt{Tier: id, Commit: true}); err != nil {
+		return err
+	}
+	ack, err := x.ReceiveAttempt(ctx)
+	if err != nil {
+		return err
+	}
+	if ack.Tier != id || !ack.Commit {
+		return fmt.Errorf("host committed tier %q for a %q rung", ack.Tier, id)
+	}
+	return nil
+}
+
+func forcedTierFor(mode p2p.TunnelMode) negotiate.Tier {
+	id, _ := forcedTier(mode)
+	return id
 }
 
 // hostTierDeps is what the host side needs to serve a forwarded connection, whatever
@@ -389,9 +423,9 @@ type hostTierDeps struct {
 }
 
 // negotiateTierHost is the host side of the handshake, invoked from the negotiate
-// stream handler. It owns the stream's lifetime, and when a tier above the floor is
-// in play it keeps that stream open for as long as the tunnel lives - see
-// serveUpperTiers.
+// stream handler. After an upper rung is committed, the handler owns the rung and
+// punched substrate while peer-level connectedness replaces the stream as its
+// liveness signal; see serveUpperTiers.
 //
 // The host never chooses: it serves whichever rung the client asks for, and the
 // client is the side that finds out a rung failed. The libp2p handler registered in
@@ -456,16 +490,14 @@ func serveUpperTiers(ctx context.Context, x *negotiate.Exchange, opts Options, p
 	}
 	defer punched.agent.Close()
 
-	// Reset rather than close on the way out. The last read on this stream is only
-	// guaranteed to unblock on a reset, and by here the tier is going away regardless;
-	// the deferred Close in negotiateTierHost is then a no-op.
-	defer s.Reset()
-
 	session := tierSession(deps.transport.Network(), peerHello, punched)
 
 	pending, err := receiveRungRequest(ctx, x)
 	for err == nil {
 		if pending.Tier == negotiate.TierLibp2p {
+			return
+		}
+		if pending.Commit {
 			return
 		}
 
@@ -493,7 +525,11 @@ func serveUpperTiers(ctx context.Context, x *negotiate.Exchange, opts Options, p
 		logTierAttempt(opts, pending.Tier, outcome, time.Since(rungStart), nil)
 		logTierSelected(pending.Tier)
 
-		pending, err = serveRung(ctx, x, activeRung{id: pending.Tier, rung: rung}, deps, s)
+		var committed bool
+		pending, committed, err = serveRung(ctx, x, activeRung{id: pending.Tier, rung: rung}, deps, s)
+		if committed {
+			return
+		}
 	}
 }
 
@@ -525,26 +561,20 @@ type activeRung struct {
 	rung tier.Rung
 }
 
-// serveRung serves one rung until the peer goes away or names a different one, then
-// tears it down and reports what it read. A returned error means there is no next
-// rung: the stream broke, or this process is shutting down.
-//
-// Watching the negotiate stream is how both of those arrive, and unifying them is the
-// point. The client sends nothing more once its rung is up, so any message at all
-// means it fell back, and any error means it is gone - a single blocking read covers
-// the peer-gone watch and the fallback signal at once. It is deliberately unbounded:
-// a healthy tunnel is silent here for its whole life.
-func serveRung(ctx context.Context, x *negotiate.Exchange, active activeRung, deps hostTierDeps, s network.Stream) (negotiate.Attempt, error) {
+// serveRung serves one rung until the client either requests another rung or commits
+// this one. After a commit the negotiate stream is no longer a liveness signal: libp2p
+// may replace its carrying connection while the peer remains reachable. The detached
+// lifetime is instead stopped by the peer-level watcher, the root context, an operator,
+// or the accept loop itself.
+func serveRung(ctx context.Context, x *negotiate.Exchange, active activeRung, deps hostTierDeps, s network.Stream) (negotiate.Attempt, bool, error) {
 	remote := s.Conn().RemotePeer()
 
 	// tierCtx is what every part of the rung unwinds from, whether the trigger is this
 	// process shutting down (ctx), the client moving on, the accept loop dying, or an
 	// operator DISCONNECT reaching the registered stop.
 	tierCtx, stopTier := context.WithCancel(ctx)
-	defer stopTier()
 
 	entry := deps.session.RegisterTier(remote, active.id, stopTier)
-	defer deps.session.UnregisterTier(remote, entry)
 
 	var live streamSet
 	var serving sync.WaitGroup
@@ -584,16 +614,86 @@ func serveRung(ctx context.Context, x *negotiate.Exchange, active activeRung, de
 		// what stops the caller from trying.
 		got = request{err: context.Cause(tierCtx)}
 	}
-	stopTier()
-	serving.Wait()
-	if got.err == nil && deps.tiers.set.SubstrateAbandoned(teardownErr) {
-		// The client is asking for the next rung and this side no longer has anything to
-		// stand it up on. Reported as an error because that is already this function's
-		// contract for "there is no next rung", and because acknowledging a tier the host
-		// cannot serve would strand the client waiting on a handshake that never comes.
-		return negotiate.Attempt{}, teardownErr
+	if got.err != nil || !got.attempt.Commit {
+		stopTier()
+		serving.Wait()
+		deps.session.UnregisterTier(remote, entry)
+		if got.err == nil && deps.tiers.set.SubstrateAbandoned(teardownErr) {
+			// The client is asking for the next rung and this side no longer has anything to
+			// stand it up on. Reported as an error because that is already this function's
+			// contract for "there is no next rung", and because acknowledging a tier the host
+			// cannot serve would strand the client waiting on a handshake that never comes.
+			return negotiate.Attempt{}, false, teardownErr
+		}
+		return got.attempt, false, got.err
 	}
-	return got.attempt, got.err
+	if got.attempt.Tier != active.id {
+		stopTier()
+		serving.Wait()
+		deps.session.UnregisterTier(remote, entry)
+		return negotiate.Attempt{}, false, fmt.Errorf("commit tier %q for active tier %q", got.attempt.Tier, active.id)
+	}
+	commitCtx, cancelCommit := context.WithTimeout(ctx, negotiateTimeout)
+	commitErr := x.SendAttempt(commitCtx, negotiate.Attempt{Tier: active.id, Commit: true})
+	cancelCommit()
+	if commitErr != nil {
+		stopTier()
+		serving.Wait()
+		deps.session.UnregisterTier(remote, entry)
+		return negotiate.Attempt{}, false, fmt.Errorf("acknowledge committed tier %q: %w", active.id, commitErr)
+	}
+
+	watcher := newTierPeerWatcher(remote)
+	deps.session.network.Notify(watcher)
+	defer deps.session.network.StopNotify(watcher)
+
+	// Notify does not replay a disconnect that happened just before registration.
+	// Close that race explicitly so a committed rung cannot survive a peer that is
+	// already gone.
+	if deps.session.network.Connectedness(remote) == network.NotConnected {
+		stopTier()
+	}
+
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+		case <-watcher.done:
+		case <-tierCtx.Done():
+		}
+		stopTier()
+	}()
+
+	// Keep this handler as the owner of both the active rung and the punched agent.
+	// It no longer reads the negotiate stream, so connection churn cannot stop the
+	// tier, but returning here early would run serveUpperTiers' deferred agent.Close
+	// and pull the substrate out from under the committed rung.
+	serving.Wait()
+	<-watcherDone
+	deps.session.UnregisterTier(remote, entry)
+	return negotiate.Attempt{}, true, nil
+}
+
+type tierPeerWatcher struct {
+	target peer.ID
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newTierPeerWatcher(target peer.ID) *tierPeerWatcher {
+	return &tierPeerWatcher{target: target, done: make(chan struct{})}
+}
+
+func (w *tierPeerWatcher) Listen(network.Network, ma.Multiaddr)         {}
+func (w *tierPeerWatcher) ListenClose(network.Network, ma.Multiaddr)    {}
+func (w *tierPeerWatcher) Connected(network.Network, network.Conn)      {}
+func (w *tierPeerWatcher) OpenedStream(network.Network, network.Stream) {}
+func (w *tierPeerWatcher) ClosedStream(network.Network, network.Stream) {}
+func (w *tierPeerWatcher) Disconnected(n network.Network, conn network.Conn) {
+	if conn.RemotePeer() == w.target && n.Connectedness(w.target) == network.NotConnected {
+		w.once.Do(func() { close(w.done) })
+	}
 }
 
 // acceptRung serves one rung's forwarded connections. It mirrors the libp2p data
@@ -762,9 +862,9 @@ var errNegotiateStream = errors.New("negotiate stream failed")
 // looped back to gather, and the stream would be carrying two different message types
 // in each direction.
 //
-// attempts of 0 or 1 skips the outcome swap entirely, leaving the wire byte-identical
-// to a peer that predates the field - see negotiate.EffectivePunchAttempts, which is
-// what both sides use to arrive at the same number without another round trip.
+// attempts of 0 or 1 skips the outcome swap entirely. Both sides use
+// negotiate.EffectivePunchAttempts to arrive at the same number without another
+// round trip.
 //
 // fingerprint is this side's QUIC certificate hash, sent whether or not the QUIC rung
 // is ever reached - the message shape stays the same on every path. On failure
@@ -948,9 +1048,9 @@ func fromPunchInfo(info negotiate.PunchInfo) nat.Credentials {
 }
 
 // peerFingerprint reads the peer's QUIC certificate hash out of the wire message. A
-// value of the wrong length - or one a peer predating the QUIC tier never sent -
-// leaves the zero fingerprint, which quictun rejects with an error naming the missing
-// value rather than a mismatch.
+// value of the wrong length leaves the zero fingerprint, which quictun rejects with
+// an error naming the missing value rather than a mismatch. The bounded wire codec
+// rejects such values earlier; this check also protects direct in-process callers.
 func peerFingerprint(info negotiate.PunchInfo) [32]byte {
 	var fp [32]byte
 	if len(info.QUICCertFingerprint) != len(fp) {

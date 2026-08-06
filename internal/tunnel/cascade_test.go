@@ -199,6 +199,22 @@ func serveCascadeCounterpart(ctx context.Context, x *negotiate.Exchange, opts Op
 			res.err = fmt.Errorf("stand up %s (%s): %w", pending.Tier, outcome, standErr)
 			return res
 		}
+		commit, commitErr := receiveRungRequest(ctx, x)
+		if commitErr != nil {
+			_ = rung.Close()
+			res.err = fmt.Errorf("receive %s commit: %w", pending.Tier, commitErr)
+			return res
+		}
+		if commit.Tier != pending.Tier || !commit.Commit {
+			_ = rung.Close()
+			res.err = fmt.Errorf("commit %+v for active tier %s", commit, pending.Tier)
+			return res
+		}
+		if commitErr = x.SendAttempt(ctx, commit); commitErr != nil {
+			_ = rung.Close()
+			res.err = fmt.Errorf("acknowledge %s commit: %w", pending.Tier, commitErr)
+			return res
+		}
 		res.served, res.rung = pending.Tier, rung
 		return res
 	}

@@ -672,6 +672,7 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 		clientMode p2p.TunnelMode
 		hostMode   p2p.TunnelMode
 		want       negotiate.Tier
+		wantErr    bool
 	}{
 		// The default on both sides. WireGuard winning here is what makes the tier
 		// default-preferred rather than opt-in.
@@ -679,9 +680,9 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 		{name: "forced wireguard both sides", clientMode: p2p.TunnelWireGuard, hostMode: p2p.TunnelWireGuard, want: negotiate.TierWireGuard},
 		{name: "host pinned to the floor", clientMode: p2p.TunnelAuto, hostMode: p2p.TunnelLibp2p, want: negotiate.TierLibp2p},
 		{name: "client pinned to the floor", clientMode: p2p.TunnelLibp2p, hostMode: p2p.TunnelAuto, want: negotiate.TierLibp2p},
-		// Incompatible forcing converges on the floor rather than failing to agree;
-		// what forcing changes is each side's response to that, not the selection.
-		{name: "incompatible forcing", clientMode: p2p.TunnelWireGuard, hostMode: p2p.TunnelLibp2p, want: negotiate.TierLibp2p},
+		// An upper-tier requirement is a policy, not just a preference: a peer that
+		// cannot provide it must fail negotiation before either side claims a floor.
+		{name: "incompatible forcing", clientMode: p2p.TunnelWireGuard, hostMode: p2p.TunnelLibp2p, wantErr: true},
 	}
 
 	hostKey := [32]byte{0xAB, 31: 0xCD}
@@ -711,6 +712,12 @@ func TestExchangeHelloResolvesTier(t *testing.T) {
 			client := <-clientOut
 			host := <-hostOut
 
+			if tt.wantErr {
+				if client.err == nil || host.err == nil {
+					t.Fatalf("exchangeHello errors: client=%v host=%v, want both to fail", client.err, host.err)
+				}
+				return
+			}
 			if client.err != nil || host.err != nil {
 				t.Fatalf("exchangeHello errors: client=%v host=%v", client.err, host.err)
 			}
